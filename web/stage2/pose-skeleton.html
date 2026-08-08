@@ -25,38 +25,310 @@ import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 //  .landmarks       → normalized image coords (0..1)  → use for DRAWING/anchoring
 //  .worldLandmarks  → metric, hip-origin, meters      → use for MEASUREMENTS (Stage 4)
 
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const W = 640, H = 480;
+
 // ---- TODO 2.1a: camera (you wrote this in Stage 0 — reuse your own code) ----
+// Same enumerate-and-skip-IR-camera pattern used in Stage 0 and the reference file.
+async function startCamera() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  const rgbCam = cams.find((d) => !/ir|infrared/i.test(d.label)) ?? cams[0];
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: rgbCam
+      ? { deviceId: { exact: rgbCam.deviceId }, width: W, height: H }
+      : { width: W, height: H, facingMode: "user" },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise((resolve) => { video.onloadedmetadata = resolve; });
+}
 
 // ---- TODO 2.1b: load PoseLandmarker ----
-// Mirror the FaceLandmarker setup in web/reference/glasses-tryon.html, but:
-//  - model: pose_landmarker_full task file from MediaPipe's storage
-//  - runningMode: "VIDEO", numPoses: 1
-// Ask Claude Code for the exact modelAssetPath rather than guessing.
-
-// ---- TODO 2.1c: detect + draw ----
-// Each new video frame (compare currentTime like the reference file does):
-//  - result = landmarker.detectForVideo(video, performance.now())
-//  - clear canvas, draw a dot per landmark (denormalize: x*640, y*480)
-//  - draw bones: lines between the pairs listed above
-//  - draw each landmark's index number next to it (tiny font) — you will use
-//    these indices constantly in Stage 3; learn them by seeing them on your body
-
-// ---- TODO 2.2: One-Euro filter ----
-// BEFORE coding, ask Claude Code: "Explain the One-Euro filter: what problem it
-// solves, what mincutoff and beta control, in plain language." Then implement a
-// OneEuroFilter class (x and y per landmark) and filter every landmark.
-// Add a keyboard toggle 'f' to switch raw/filtered so you SEE the difference.
+// Verified model URL (same storage bucket structure as the FaceLandmarker
+// path in web/reference/glasses-tryon.html, just a different task family).
+let landmarker;
+async function loadLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    outputSegmentationMasks: true,
+  });
+}
 
 // ---- TODO 2.3: segmentation ----
-// Enable outputSegmentationMasks in PoseLandmarker options; draw the mask as a
-// translucent tint over your body. Understand what the mask buffer is (a per-pixel
-// person-probability image) — in Stage 3 it becomes your occlusion layer.
+// segmentationMasks[0] is an MPMask: a per-pixel person-probability image
+// (0 = definitely background, 1 = definitely person), at the input frame's
+// resolution. In Stage 3 this becomes the occlusion layer — wherever the
+// mask says "person" but it's NOT the torso region, that's what needs to
+// draw in front of the garment (e.g. crossed arms).
+let maskCanvas, maskCtx;
+function drawSegmentationMask(mask) {
+  const w = mask.width;
+  const h = mask.height;
+  if (!maskCanvas) {
+    maskCanvas = document.createElement("canvas");
+    maskCtx = maskCanvas.getContext("2d");
+  }
+  maskCanvas.width = w;
+  maskCanvas.height = h;
+
+  // getAsFloat32Array() gives one probability value per pixel; we turn
+  // that into an RGBA tint by using the probability directly as alpha —
+  // confidently-person pixels are more opaque, uncertain edges fade out.
+  const probs = mask.getAsFloat32Array();
+  const imageData = maskCtx.createImageData(w, h);
+  for (let i = 0; i < probs.length; i++) {
+    imageData.data[i * 4 + 0] = 0;
+    imageData.data[i * 4 + 1] = 220;
+    imageData.data[i * 4 + 2] = 255;
+    imageData.data[i * 4 + 3] = probs[i] * 130;
+  }
+  maskCtx.putImageData(imageData, 0, 0);
+
+  // Scale from the mask's native resolution to the display canvas size —
+  // these aren't guaranteed to match.
+  ctx.drawImage(maskCanvas, 0, 0, w, h, 0, 0, W, H);
+}
+
+// ---- TODO 2.2: One-Euro filter ----
+// Standard One-Euro filter (Casiez et al. 2012). Each tracked value (we use
+// one instance per landmark per axis, so 33 * 2 = 66 total) keeps its own
+// exponential moving average PLUS a moving average of its own rate of
+// change — that derivative estimate is what lets the cutoff adapt to speed.
+function smoothingFactor(dt, cutoff) {
+  const r = 2 * Math.PI * cutoff * dt;
+  return r / (r + 1);
+}
+
+class LowPassFilter {
+  filter(value, alpha) {
+    this.y = this.initialized ? alpha * value + (1 - alpha) * this.y : value;
+    this.initialized = true;
+    return this.y;
+  }
+}
+
+class OneEuroFilter {
+  constructor({ minCutoff = 1.2, beta = 0.02, dCutoff = 1.0 } = {}) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xFilter = new LowPassFilter();
+    this.dxFilter = new LowPassFilter();
+    this.lastValue = null;
+    this.lastTime = null;
+  }
+  filter(value, timestampMs) {
+    // First call: nothing to compare against yet, so just seed the state.
+    if (this.lastTime === null) {
+      this.lastTime = timestampMs;
+      this.lastValue = value;
+      return this.xFilter.filter(value, 1);
+    }
+
+    const dt = Math.max((timestampMs - this.lastTime) / 1000, 1 / 240);
+    this.lastTime = timestampMs;
+
+    // Estimate speed (derivative), itself smoothed to avoid the speed
+    // estimate being just as noisy as the raw signal would be.
+    const dValue = (value - this.lastValue) / dt;
+    this.lastValue = value;
+    const edValue = this.dxFilter.filter(dValue, smoothingFactor(dt, this.dCutoff));
+
+    // Cutoff grows with estimated speed: fast motion -> higher cutoff ->
+    // less smoothing/lag. Still -> cutoff stays near minCutoff -> jitter
+    // gets smoothed out.
+    const cutoff = this.minCutoff + this.beta * Math.abs(edValue);
+    return this.xFilter.filter(value, smoothingFactor(dt, cutoff));
+  }
+}
+
+// One filter pair (x, y) per landmark, created once and reused every frame
+// so each filter's internal state (and therefore its speed estimate)
+// persists across frames — recreating them each frame would defeat the
+// whole point.
+const filterBank = Array.from({ length: 33 }, () => ({
+  x: new OneEuroFilter(),
+  y: new OneEuroFilter(),
+}));
+
+let useFilter = true;
+window.addEventListener("keydown", (e) => {
+  if (e.key === "f") useFilter = !useFilter;
+});
 
 // ---- TODO 2.4: measurements v0 ----
-// From result.worldLandmarks: shoulder width = distance(11,12) in meters.
-// Height estimate = vertical span nose→ankle midpoint (rough; that's fine).
-// Keep a rolling average over the last 30 frames where tracking confidence is
-// high; print both numbers on the canvas. Stand still: they should be stable.
+// Uses worldLandmarks (metric, meters, hip-origin) rather than the
+// normalized 0..1 landmarks used for drawing — measurements need real
+// units, not screen-relative fractions.
+const MEASURE_WINDOW = 30;
+const VISIBILITY_THRESHOLD = 0.5;
+const shoulderWidthHistory = [];
+const heightHistory = [];
+
+function rollingAverage(arr) {
+  return arr.reduce((sum, v) => sum + v, 0) / arr.length;
+}
+
+function updateMeasurements(worldLms) {
+  // Only trust this frame's measurement if the landmarks it depends on
+  // are ones the model is actually confident about — visibility is
+  // MediaPipe's own per-landmark confidence score (0..1). `?? 1` treats a
+  // missing visibility field as "fully visible" rather than failing closed.
+  const needed = [0, 11, 12, 27, 28]; // nose, shoulders, ankles
+  const confident = needed.every((i) => (worldLms[i].visibility ?? 1) >= VISIBILITY_THRESHOLD);
+  if (!confident) return;
+
+  const ls = worldLms[11], rs = worldLms[12];
+  const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y, ls.z - rs.z);
+
+  const nose = worldLms[0];
+  const ankleMidY = (worldLms[27].y + worldLms[28].y) / 2;
+  const height = Math.abs(nose.y - ankleMidY); // sign of the y axis doesn't matter here, only span
+
+  shoulderWidthHistory.push(shoulderWidth);
+  if (shoulderWidthHistory.length > MEASURE_WINDOW) shoulderWidthHistory.shift();
+
+  heightHistory.push(height);
+  if (heightHistory.length > MEASURE_WINDOW) heightHistory.shift();
+}
+
+// Bone connections for the landmarks called out above — enough for a
+// recognizable skeleton without drawing all 33 points' worth of connections.
+const BONES = [
+  [11, 12], // shoulders
+  [11, 13], [13, 15], // left arm
+  [12, 14], [14, 16], // right arm
+  [11, 23], [12, 24], // torso sides
+  [23, 24], // hips
+  [23, 25], [25, 27], // left leg
+  [24, 26], [26, 28], // right leg
+];
+
+// ---- TODO 2.1c: detect + draw ----
+let lastVideoTime = -1;
+function loop() {
+  requestAnimationFrame(loop);
+  if (!landmarker || video.readyState < 2) return;
+
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, performance.now());
+
+    ctx.clearRect(0, 0, W, H);
+
+    // mask tint first, so the skeleton draws on top of it, not under it
+    if (result.segmentationMasks?.length) {
+      const mask = result.segmentationMasks[0];
+      drawSegmentationMask(mask);
+      mask.close(); // MPMask owns GPU/WASM-side resources — must release explicitly
+    }
+
+    if (result.worldLandmarks?.length) {
+      updateMeasurements(result.worldLandmarks[0]);
+    }
+
+    if (result.landmarks?.length) {
+      const rawLms = result.landmarks[0];
+      const now = performance.now();
+
+      // Always run every landmark through its filter, even when displaying
+      // raw — this keeps each filter's internal speed estimate warm, so
+      // toggling back to filtered mode doesn't produce a visible jump from
+      // stale state.
+      const filteredLms = rawLms.map((lm, i) => ({
+        x: filterBank[i].x.filter(lm.x, now),
+        y: filterBank[i].y.filter(lm.y, now),
+      }));
+      const lms = useFilter ? filteredLms : rawLms;
+
+      // bones first, so dots/labels draw on top of the lines, not under them
+      ctx.strokeStyle = "#0f0";
+      ctx.lineWidth = 2;
+      for (const [a, b] of BONES) {
+        ctx.beginPath();
+        ctx.moveTo(lms[a].x * W, lms[a].y * H);
+        ctx.lineTo(lms[b].x * W, lms[b].y * H);
+        ctx.stroke();
+      }
+
+      // dots
+      ctx.fillStyle = "#ff3355";
+      for (const lm of lms) {
+        ctx.beginPath();
+        ctx.arc(lm.x * W, lm.y * H, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // index labels — same context-flip trick as Stage 0's FPS counter,
+      // done once for all 33 labels rather than per-label for efficiency.
+      ctx.save();
+      ctx.scale(-1, 1);
+      ctx.fillStyle = "#fff";
+      ctx.font = "9px monospace";
+      lms.forEach((lm, i) => {
+        const x = lm.x * W;
+        const y = lm.y * H;
+        ctx.fillText(i, -(x + 8), y - 6);
+      });
+      ctx.restore();
+    }
+
+    // mode indicator, top-left, same mirror-flip trick
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.fillStyle = useFilter ? "#0f0" : "#ff0";
+    ctx.font = "14px monospace";
+    ctx.fillText(`${useFilter ? "FILTERED" : "RAW"} (press f to toggle)`, -W + 10, 20);
+    ctx.restore();
+
+    // measurements, bottom-left, rolling average over the last 30
+    // confident frames — only draw once we actually have samples
+    if (shoulderWidthHistory.length) {
+      ctx.save();
+      ctx.scale(-1, 1);
+      ctx.fillStyle = "#0ff";
+      ctx.font = "13px monospace";
+      ctx.fillText(
+        `shoulder width: ${rollingAverage(shoulderWidthHistory).toFixed(2)} m`,
+        -W + 10, H - 32
+      );
+      ctx.fillText(
+        `height (rough): ${rollingAverage(heightHistory).toFixed(2)} m`,
+        -W + 10, H - 12
+      );
+      ctx.restore();
+    }
+  }
+}
+
+// ---- boot ----
+(async () => {
+  await startCamera();
+  await loadLandmarker();
+  loop();
+})();
+
+// TODO 2.2 (One-Euro filter) implemented above, near BONES — see
+// OneEuroFilter/filterBank and the 'f' keydown toggle.
+
+// TODO 2.3 (segmentation) implemented above, near loadLandmarker — see
+// outputSegmentationMasks, drawSegmentationMask, and mask.close() in loop().
+
+// TODO 2.4 (measurements v0) implemented above, near BONES — see
+// updateMeasurements/shoulderWidthHistory/heightHistory.
 </script>
 </body>
 </html>

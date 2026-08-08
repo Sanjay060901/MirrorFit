@@ -49,16 +49,16 @@ Goal: scene/camera/renderer trio + transforms, the rendering half of the product
 
 Goal: the perception half. 33 landmarks, live, on you.
 
-- [ ] **2.1 Skeleton overlay** — `web/stage2/pose-skeleton.html`
+- [x] **2.1 Skeleton overlay** — `web/stage2/pose-skeleton.html`
   - Tasks Vision PoseLandmarker (VIDEO mode), draw dots + bones on canvas
   - Acceptance: skeleton tracks you at 25+fps; landmarks labeled by index
-- [ ] **2.2 Smoothing**
+- [x] **2.2 Smoothing**
   - Implement One-Euro filter per landmark (Claude Code explains the math first)
   - Acceptance: visible jitter reduction with a toggle to compare raw vs filtered
-- [ ] **2.3 Segmentation**
+- [x] **2.3 Segmentation**
   - Add person segmentation; tint your silhouette; understand the mask
   - Acceptance: mask follows you; you can explain how it will drive occlusion
-- [ ] **2.4 Measurements v0**
+- [x] **2.4 Measurements v0**
   - Shoulder width + height estimate from world landmarks, printed on screen
   - Acceptance: numbers are stable when you stand still (rolling average works)
 

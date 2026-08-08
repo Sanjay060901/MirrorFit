@@ -13,7 +13,7 @@ the same web app as an in-store smart-mirror kiosk (QR/RFID-triggered).
   (face-based, but the capture→track→anchor→render→smooth structure is the template)
 
 ## Current stage
-Stage 2 (see OPERATION_PLAN.md). Update this line as stages complete.
+Stage 3 (see OPERATION_PLAN.md). Update this line as stages complete.
 
 ## How to work with me (IMPORTANT — I am learning this stack)
 - I know Python/FastAPI/AWS/DevOps well. I am LEARNING JS, Three.js, MediaPipe, 3D math.
