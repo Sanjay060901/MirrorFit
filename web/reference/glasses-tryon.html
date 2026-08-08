@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Glasses try-on — MediaPipe + Three.js</title>
+<style>
+  body { margin: 0; background: #111; display: flex; flex-direction: column; align-items: center; font-family: system-ui, sans-serif; color: #ddd; }
+  h1 { font-size: 18px; font-weight: 500; margin: 16px 0 8px; }
+  #stage { position: relative; }
+  /* Mirror both layers so it behaves like a mirror */
+  #video, #overlay { transform: scaleX(-1); }
+  #video { display: block; border-radius: 12px; }
+  #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+  #status { font-size: 13px; color: #888; margin: 10px 0 20px; }
+</style>
+</head>
+<body>
+<h1>Virtual glasses try-on</h1>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<p id="status">Loading face tracking model…</p>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const videoEl = document.getElementById("video");
+const canvasEl = document.getElementById("overlay");
+const statusEl = document.getElementById("status");
+
+const W = 640, H = 480;
+
+// ---------- 1. Camera feed ----------
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: W, height: H, facingMode: "user" },
+    audio: false,
+  });
+  videoEl.srcObject = stream;
+  await new Promise((res) => (videoEl.onloadedmetadata = res));
+  videoEl.width = W; videoEl.height = H;
+}
+
+// ---------- 2. MediaPipe FaceLandmarker ----------
+let landmarker;
+async function loadLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await FaceLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numFaces: 1,
+    // This is the key option: gives us a 4x4 head-pose matrix per face,
+    // so we never compute yaw/pitch/roll by hand.
+    outputFacialTransformationMatrixes: true,
+  });
+}
+
+// ---------- 3. Three.js scene ----------
+const renderer = new THREE.WebGLRenderer({
+  canvas: canvasEl,
+  alpha: true,          // transparent canvas — video shows through
+  antialias: true,
+});
+renderer.setSize(W, H);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+const scene = new THREE.Scene();
+
+// Pixel-perfect camera trick:
+// with this z distance, 1 world unit == 1 screen pixel at the z=0 plane.
+const FOV = 60;
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 1, 5000);
+camera.position.z = H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(0, 200, 400);
+scene.add(dir);
+
+// ---------- 4. The glasses ----------
+// The group is what we move/rotate/scale each frame.
+// Build the model so its total width is ~1 world unit, centered on the
+// nose bridge — then scaling by eye distance "just works".
+const glasses = new THREE.Group();
+scene.add(glasses);
+glasses.visible = false;
+
+function buildProceduralGlasses() {
+  const mat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.35, metalness: 0.4 });
+  const lensMat = new THREE.MeshStandardMaterial({
+    color: 0x88aacc, roughness: 0.1, metalness: 0.2,
+    transparent: true, opacity: 0.25,
+  });
+
+  const R = 0.22;          // lens radius (model units; total width ≈ 1)
+  const eyeOffset = 0.27;  // lens center distance from middle
+
+  for (const side of [-1, 1]) {
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(R, 0.022, 12, 40), mat);
+    rim.position.set(side * eyeOffset, 0, 0);
+    glasses.add(rim);
+
+    const lens = new THREE.Mesh(new THREE.CircleGeometry(R, 40), lensMat);
+    lens.position.set(side * eyeOffset, 0, 0);
+    glasses.add(lens);
+
+    // Temple arms going back toward the ears (negative z = away from camera
+    // after the head-pose rotation is applied)
+    const temple = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.55, 8), mat);
+    temple.rotation.x = Math.PI / 2;
+    temple.position.set(side * (eyeOffset + R), 0.02, -0.27);
+    glasses.add(temple);
+  }
+
+  // Nose bridge
+  const bridge = new THREE.Mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.12, 8), mat);
+  bridge.rotation.z = Math.PI / 2;
+  glasses.add(bridge);
+}
+buildProceduralGlasses();
+
+// To use a real frame model instead (e.g. from your Lenskart-style catalog),
+// replace buildProceduralGlasses() with:
+//
+// new GLTFLoader().load("/models/frame-01.glb", (gltf) => {
+//   const model = gltf.scene;
+//   // Normalize: center on nose bridge, scale so lens-to-lens width = 1 unit
+//   const box = new THREE.Box3().setFromObject(model);
+//   const size = box.getSize(new THREE.Vector3());
+//   model.scale.setScalar(1 / size.x);
+//   glasses.add(model);
+// });
+
+// ---------- 5. Per-frame tracking loop ----------
+const NOSE_BRIDGE = 168;   // between the eyes
+const LEFT_EYE_OUTER = 33;
+const RIGHT_EYE_OUTER = 263;
+
+const tmpMat = new THREE.Matrix4();
+const tmpQuat = new THREE.Quaternion();
+const smoothQuat = new THREE.Quaternion();
+const smoothPos = new THREE.Vector3();
+let hasPose = false;
+
+function toWorld(lm) {
+  // normalized (0..1) landmark -> pixel-space world coords at z=0 plane
+  return new THREE.Vector3(
+    (lm.x - 0.5) * W,
+    -(lm.y - 0.5) * H,
+    0
+  );
+}
+
+let lastVideoTime = -1;
+function loop() {
+  requestAnimationFrame(loop);
+  if (!landmarker || videoEl.readyState < 2) return;
+
+  if (videoEl.currentTime !== lastVideoTime) {
+    lastVideoTime = videoEl.currentTime;
+    const result = landmarker.detectForVideo(videoEl, performance.now());
+
+    if (result.faceLandmarks?.length) {
+      const lms = result.faceLandmarks[0];
+
+      // --- position: anchor to nose bridge ---
+      const anchor = toWorld(lms[NOSE_BRIDGE]);
+      // push glasses slightly toward camera so rims sit "on" the face
+      anchor.z = 20;
+
+      // --- scale: from outer eye corner distance in pixels ---
+      const eyeDist = toWorld(lms[LEFT_EYE_OUTER])
+        .distanceTo(toWorld(lms[RIGHT_EYE_OUTER]));
+      const scale = eyeDist * 1.45; // model width 1 unit -> ~1.45x eye span
+
+      // --- rotation: from the facial transformation matrix ---
+      const m = result.facialTransformationMatrixes?.[0];
+      if (m) {
+        tmpMat.fromArray(m.data);
+        tmpQuat.setFromRotationMatrix(tmpMat);
+        // Axis fix: MediaPipe's matrix is in a camera space where
+        // y and z point opposite to Three.js conventions.
+        tmpQuat.x *= -1;
+        tmpQuat.z *= -1;
+      }
+
+      // --- smoothing (simple lerp/slerp kills jitter) ---
+      if (!hasPose) {
+        smoothPos.copy(anchor);
+        smoothQuat.copy(tmpQuat);
+        hasPose = true;
+      } else {
+        smoothPos.lerp(anchor, 0.4);
+        smoothQuat.slerp(tmpQuat, 0.4);
+      }
+
+      glasses.position.copy(smoothPos);
+      glasses.quaternion.copy(smoothQuat);
+      glasses.scale.setScalar(scale);
+      glasses.visible = true;
+      statusEl.textContent = "Tracking — turn your head to test the pose.";
+    } else {
+      glasses.visible = false;
+      hasPose = false;
+      statusEl.textContent = "No face detected — face the camera.";
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ---------- boot ----------
+(async () => {
+  try {
+    await startCamera();
+    await loadLandmarker();
+    statusEl.textContent = "Model loaded — looking for a face…";
+    loop();
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message + " (camera permission? serve over http://localhost, not file://)";
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>

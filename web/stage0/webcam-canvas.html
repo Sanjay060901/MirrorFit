@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 0.1 — Webcam on canvas</title>
+<style>
+  body { margin: 0; background: #111; display: grid; place-items: center; min-height: 100vh; }
+  canvas { border-radius: 12px; transform: scaleX(-1); /* mirror like a mirror */ }
+</style>
+</head>
+<body>
+<!-- NOTE: the <video> element is hidden; YOU draw its frames to the canvas.
+     This is the core skill: in this project the browser never displays the
+     video directly — your code composites everything, every frame. -->
+<video id="video" autoplay playsinline muted style="display:none"></video>
+<canvas id="canvas" width="640" height="480"></canvas>
+
+<script type="module">
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+// ---- TODO 1: startCamera() ----
+// Use navigator.mediaDevices.getUserMedia to request a 640x480 user-facing
+// camera stream (video only). Assign it to video.srcObject, then await
+// the 'loadedmetadata' event before returning.
+// Hints: getUserMedia returns a Promise. Wrap the event wait in a Promise too.
+async function startCamera() {
+  // your code here
+}
+
+// ---- TODO 2: FPS counter state ----
+// Keep: frame count, last timestamp, current fps value.
+// Recompute fps once per second, not every frame.
+
+// ---- TODO 3: the render loop ----
+// Using requestAnimationFrame:
+//   1. draw the current video frame to the canvas (ctx.drawImage)
+//   2. update + draw the FPS number (ctx.fillText) top-left
+//   3. schedule the next frame
+// Question to answer for yourself BEFORE running: why requestAnimationFrame
+// and not setInterval(loop, 33)? (Ask Claude Code to check your answer.)
+function loop(timestamp) {
+  // your code here
+}
+
+// ---- TODO 4 (task 0.2): moving overlay ----
+// a) draw a filled circle that follows the mouse (listen to 'mousemove' on canvas;
+//    careful: the canvas is mirrored with CSS — does your x need flipping?)
+// b) then add a second circle that bounces off the edges by itself.
+// If you see "ghost trails", figure out why before asking. (It's draw order.)
+
+// ---- boot ----
+(async () => {
+  await startCamera();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

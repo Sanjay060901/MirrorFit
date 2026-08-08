@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 1 — Three.js foundations</title>
+<style> body { margin: 0; background: #111; } canvas { display: block; } </style>
+</head>
+<body>
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+// The trio you will use in EVERY graphics file in this project:
+//   Scene  = the world (what exists)
+//   Camera = the eye (what's visible, from where)
+//   Renderer = the painter (draws camera's view of scene to a canvas)
+
+// ---- TODO 1.1a: create the trio ----
+// - PerspectiveCamera: fov 60, aspect = window aspect, near 0.1, far 1000,
+//   positioned at z = 5 looking at origin
+// - WebGLRenderer with antialias, sized to the window, appended to document.body
+
+// ---- TODO 1.1b: a lit cube ----
+// - BoxGeometry(1,1,1) + MeshStandardMaterial (pick a color)
+// - AmbientLight (soft) + DirectionalLight (angled) — try removing each to SEE
+//   what they do. MeshStandardMaterial is black without lights. Why?
+
+// ---- TODO 1.1c: animate ----
+// - render loop with requestAnimationFrame; rotate the cube a little each frame
+// - handle window 'resize': update camera.aspect + updateProjectionMatrix + renderer size
+
+// ---- TODO 1.2: transforms lab ----
+// - mousemove: map mouse x/y to cube position.x/y (you'll need to convert
+//   pixel coords → world coords; think about what the visible world width is at z=0)
+// - wheel: scale the cube up/down (clamp it)
+// - rotate with a quaternion: build one with setFromAxisAngle and multiply it
+//   into cube.quaternion each frame. Then ask Claude Code: "explain gimbal lock
+//   and why we'll use quaternions for the garment in Stage 3."
+
+// ---- TODO 1.3: glTF ----
+// - find any free .glb (e.g. Khronos sample models on GitHub), load with GLTFLoader
+// - normalize: use new THREE.Box3().setFromObject(model) to get its size, then
+//   scale so its largest dimension is 2 world units, and center it at origin.
+//   (This exact normalization idea reappears in the garment asset pipeline.)
+
+// ---- TODO 1.4: transparent overlay (the product's layer stack) ----
+// - new file or extend: put a <video> webcam feed (from Stage 0) behind this
+//   canvas via CSS (position:absolute stacking), create the renderer with
+//   { alpha: true }, and DON'T set scene.background.
+// - Acceptance: your cube floats over your live camera image.
+//   That layered structure IS MirrorFit's render architecture.
+</script>
+</body>
+</html>

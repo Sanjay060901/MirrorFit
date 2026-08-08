@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 3 — Tier 1 garment try-on (P1 prototype)</title>
+<style>
+  body { margin: 0; background: #111; display: grid; place-items: center; min-height: 100vh; }
+  #stage { position: relative; }
+  video, canvas { transform: scaleX(-1); }
+  canvas { position: absolute; top: 0; left: 0; }
+  #ui { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted width="640" height="480"></video>
+  <canvas id="overlay" width="640" height="480"></canvas>
+</div>
+<div id="ui"><!-- garment picker buttons + snapshot button go here (task 3.4) --></div>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// You are assembling everything you built in Stages 0–2 into the product.
+// Architecture (same as web/reference/glasses-tryon.html, body instead of face):
+//   camera → PoseLandmarker → filter → anchor garment plane → Three.js composite
+
+// ---- TODO 3.1: rigid anchor ----
+// 1. Stage 1.4's setup: transparent Three.js canvas over the video, pixel-perfect
+//    camera trick (camera z = H/2 / tan(fov/2), 1 world unit = 1 pixel at z=0).
+// 2. A THREE.PlaneGeometry "torso proxy":
+//    - position: midpoint of shoulders(11,12) and hips(23,24), converted from
+//      normalized coords to pixel-world coords (Stage 0 skill)
+//    - width: shoulder pixel distance * ~1.15   height: shoulder-to-hip distance * ~1.4
+//    - roll: angle of the shoulder line (atan2) applied as rotation.z
+// 3. One-Euro filter (your Stage 2 class) on the anchor points, NOT the output.
+// Acceptance: a semi-transparent rectangle glued to your torso through lean/step.
+
+// ---- TODO 3.2: control-mesh warp ----
+// Replace the rigid plane with PlaneGeometry(w, h, 4, 6) — a grid with vertices.
+// Texture it with a garment PNG (make one: any t-shirt photo, background removed,
+// saved to web/assets/). Each frame, move specific vertices of geometry.attributes.position:
+//   top corners → shoulder landmarks; mid-edge verts → interpolated torso sides;
+//   bottom edge → hip line, extended for garment length.
+// Set position.needsUpdate = true after edits.
+// Ask Claude Code FIRST: "Explain how BufferGeometry position attributes work and
+// how vertex indices are laid out in a PlaneGeometry grid." Then implement.
+// Acceptance: the shirt bends when you lean sideways instead of staying rigid.
+
+// ---- TODO 3.3: occlusion + honesty fade ----
+// a) Segmentation mask (Stage 2.3) as occlusion: composite so your ARMS render in
+//    front of the garment when crossed. Simplest v1: draw the masked video pixels
+//    on a canvas layer ABOVE the garment for high-person-probability regions that
+//    are NOT torso. Discuss the approach with Claude Code before coding — there
+//    are several valid designs; choose one you can explain.
+// b) Yaw estimate from shoulder foreshortening (visible shoulder width vs its
+//    rolling max). Past ~35°, fade the garment material.opacity toward 0.
+// Acceptance: arms-crossed test passes; turning fades the garment gracefully.
+
+// ---- TODO 3.4: ship it ----
+// - 3 garment PNGs + picker buttons; snapshot (composite video+overlay to a temp
+//   canvas → toDataURL → download link)
+// - Deploy: S3 static hosting + CloudFront (you know this part cold).
+// - Send the URL to 10 people. Write their feedback into docs/p1-feedback.md.
+// THIS COMPLETES P1. Update CLAUDE.md's "Current stage" and OPERATION_PLAN.md.
+</script>
+</body>
+</html>
