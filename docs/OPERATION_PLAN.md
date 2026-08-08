@@ -14,33 +14,34 @@ acceptance criteria pass on your machine.
 
 Goal: own the render loop. Everything in this project sits on it.
 
-- [ ] **0.1 Webcam on canvas** — `web/stage0/webcam-canvas.html`
+- [x] **0.1 Webcam on canvas** — `web/stage0/webcam-canvas.html`
   - getUserMedia → `<video>` → draw each frame to `<canvas>` via requestAnimationFrame
   - Acceptance: live mirrored feed at 30fps, FPS counter drawn on canvas
   - Claude Code prompt: *"Explain requestAnimationFrame vs setInterval, then review
     my TODO attempt in web/stage0/webcam-canvas.html. Don't rewrite it — point at
     problems and ask me questions."*
-- [ ] **0.2 Moving overlay** — extend 0.1
+- [x] **0.2 Moving overlay** — extend 0.1
   - Draw a circle that follows the mouse over the video; then one that bounces
   - Acceptance: no flicker, no ghosting (you understand clearRect and draw order)
-- [ ] **0.3 Concept check** (no code) — explain to Claude Code in your own words:
-  event loop, async/await, why the video element isn't drawn by the browser but by you
+- [ ] ~~**0.3 Concept check**~~ (no code) — SKIPPED 2026-08-08, moved straight to
+  Stage 1. explain to Claude Code in your own words: event loop, async/await, why
+  the video element isn't drawn by the browser but by you
   - Acceptance: Claude Code agrees your explanation has no gaps
 
 ## Stage 1 — Three.js foundations (Week 3–4)
 
 Goal: scene/camera/renderer trio + transforms, the rendering half of the product.
 
-- [ ] **1.1 First scene** — `web/stage1/three-basics.html`
+- [x] **1.1 First scene** — `web/stage1/three-basics.html`
   - Rotating cube, ambient + directional light, resize handling
   - Acceptance: cube spins; you can explain what the camera frustum is
-- [ ] **1.2 Transforms lab** — same file, keep going
+- [x] **1.2 Transforms lab** — same file, keep going
   - Move cube with mouse; scale with wheel; rotate with quaternion (not Euler)
   - Acceptance: you can say why quaternions beat Euler angles (gimbal lock) in 3 sentences
-- [ ] **1.3 glTF loading**
+- [x] **1.3 glTF loading**
   - Load any free glTF from the web, orbit it, normalize its size with Box3
   - Acceptance: model loads, is centered, fits view regardless of source scale
-- [ ] **1.4 Transparent overlay scene**
+- [x] **1.4 Transparent overlay scene**
   - Three.js canvas (alpha:true) stacked over the Stage 0 webcam feed
   - Acceptance: cube floats over your live video — this IS the product's layer stack
 

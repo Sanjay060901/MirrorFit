@@ -26,12 +26,43 @@ const ctx = canvas.getContext("2d");
 // the 'loadedmetadata' event before returning.
 // Hints: getUserMedia returns a Promise. Wrap the event wait in a Promise too.
 async function startCamera() {
-  // your code here
+  // Step 1: build the constraints object getUserMedia expects.
+  // Shape: { video: { width, height, facingMode }, audio: <bool> }
+  // - width/height: numbers, 640 and 480
+  // - facingMode: a string meaning "front-facing camera" — look up the
+  //   MDN page for getUserMedia if you don't remember the exact value
+  // - audio: we don't want a mic, what goes here?
+  const constraints = {
+    video: { width: 640, height: 480, facingMode: "user" },
+    audio: false,
+  };
+
+  // Step 2: call navigator.mediaDevices.getUserMedia(constraints).
+  // It returns a Promise<MediaStream> — you need the resolved stream,
+  // not the Promise itself, so this line needs an await.
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+  // Step 3: hand the stream to the <video> element so it starts loading.
+  // Which property on `video` accepts a MediaStream directly?
+  video.srcObject = stream;
+
+  // Step 4: the video's dimensions aren't ready the instant srcObject is
+  // set — you must wait for the 'loadedmetadata' event before returning,
+  // otherwise later code that reads video size/frames may run too early.
+  // addEventListener-style callbacks aren't awaitable on their own, so
+  // wrap it: `await new Promise((resolve) => { ... })` where inside you
+  // set video.onloadedmetadata to call resolve when the event fires.
+  await new Promise((resolve) => {
+    video.onloadedmetadata = resolve;
+  });
 }
 
 // ---- TODO 2: FPS counter state ----
 // Keep: frame count, last timestamp, current fps value.
 // Recompute fps once per second, not every frame.
+let frameCount = 0;
+let lastFpsTime = 0;
+let fps = 0;
 
 // ---- TODO 3: the render loop ----
 // Using requestAnimationFrame:
@@ -41,7 +72,44 @@ async function startCamera() {
 // Question to answer for yourself BEFORE running: why requestAnimationFrame
 // and not setInterval(loop, 33)? (Ask Claude Code to check your answer.)
 function loop(timestamp) {
-  // your code here
+  // 1. draw the current video frame to the canvas
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // 2. update fps once per second, not every frame
+  frameCount++;
+  if (timestamp - lastFpsTime >= 1000) {
+    fps = Math.round((frameCount * 1000) / (timestamp - lastFpsTime));
+    frameCount = 0;
+    lastFpsTime = timestamp;
+  }
+
+  // 3. draw the fps number top-left
+  ctx.fillStyle = "#0f0";
+  ctx.font = "16px monospace";
+  // undo the canvas's CSS mirror just for the text, so it reads left-to-right
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.fillText(`FPS: ${fps}`, -70, 20);
+  ctx.restore();
+
+  // 4a. mouse-follow circle
+  ctx.beginPath();
+  ctx.arc(mouseX, mouseY, 15, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255, 90, 90, 0.85)";
+  ctx.fill();
+
+  // 4b. bouncing circle — advance position, bounce off edges, then draw
+  bounceX += bounceDX;
+  bounceY += bounceDY;
+  if (bounceX - BOUNCE_R < 0 || bounceX + BOUNCE_R > canvas.width) bounceDX *= -1;
+  if (bounceY - BOUNCE_R < 0 || bounceY + BOUNCE_R > canvas.height) bounceDY *= -1;
+  ctx.beginPath();
+  ctx.arc(bounceX, bounceY, BOUNCE_R, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(90, 160, 255, 0.85)";
+  ctx.fill();
+
+  // 5. schedule next frame
+  requestAnimationFrame(loop);
 }
 
 // ---- TODO 4 (task 0.2): moving overlay ----
@@ -49,6 +117,25 @@ function loop(timestamp) {
 //    careful: the canvas is mirrored with CSS — does your x need flipping?)
 // b) then add a second circle that bounces off the edges by itself.
 // If you see "ghost trails", figure out why before asking. (It's draw order.)
+
+// a) mouse-follow circle state
+let mouseX = canvas.width / 2;
+let mouseY = canvas.height / 2;
+canvas.addEventListener("mousemove", (e) => {
+  // The canvas is CSS-mirrored (scaleX(-1)), so browser mouse coordinates
+  // (offsetX/offsetY, measured in the visually-mirrored box) don't match
+  // the canvas's internal drawing space. Flip x to convert screen space
+  // into canvas-internal space; y isn't mirrored, so it needs no change.
+  mouseX = canvas.width - e.offsetX;
+  mouseY = e.offsetY;
+});
+
+// b) bouncing circle state
+let bounceX = 100;
+let bounceY = 100;
+let bounceDX = 3;
+let bounceDY = 2;
+const BOUNCE_R = 15;
 
 // ---- boot ----
 (async () => {

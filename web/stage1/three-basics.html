@@ -3,12 +3,34 @@
 <head>
 <meta charset="UTF-8" />
 <title>Stage 1 — Three.js foundations</title>
-<style> body { margin: 0; background: #111; } canvas { display: block; } </style>
+<style>
+  body { margin: 0; background: #111; }
+  /* #stage is the shared positioning context both layers stack inside —
+     without position:relative here, the absolutely-positioned children
+     below would position against the page/body instead of this box. */
+  #stage { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+  #webcam {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1); /* mirror like a mirror */
+  }
+  canvas { position: absolute; top: 0; left: 0; display: block; }
+</style>
 </head>
 <body>
+<div id="stage">
+  <video id="webcam" autoplay playsinline muted></video>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
 <script type="module">
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import * as THREE from "three";
 import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/DRACOLoader.js";
 
 // The trio you will use in EVERY graphics file in this project:
 //   Scene  = the world (what exists)
@@ -16,39 +38,158 @@ import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/
 //   Renderer = the painter (draws camera's view of scene to a canvas)
 
 // ---- TODO 1.1a: create the trio ----
-// - PerspectiveCamera: fov 60, aspect = window aspect, near 0.1, far 1000,
-//   positioned at z = 5 looking at origin
-// - WebGLRenderer with antialias, sized to the window, appended to document.body
+const scene = new THREE.Scene();
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  1000
+);
+camera.position.z = 5;
+camera.lookAt(0, 0, 0);
+
+// alpha:true makes the canvas's own background transparent, so whatever
+// sits behind it in the DOM (the webcam <video>) shows through anywhere
+// the scene doesn't draw over. Combined with never setting scene.background,
+// this is the entire trick behind the layered camera+3D compositing this
+// whole product relies on.
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.getElementById("stage").appendChild(renderer.domElement);
+
+// ---- TODO 1.4: webcam background ----
+// Same enumerate-and-skip-IR-camera pattern as the reference glasses demo —
+// see web/reference/glasses-tryon.html if you want to compare.
+async function startWebcamBackground() {
+  const webcamEl = document.getElementById("webcam");
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  const rgbCam = cams.find((d) => !/ir|infrared/i.test(d.label)) ?? cams[0];
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: rgbCam ? { deviceId: { exact: rgbCam.deviceId } } : { facingMode: "user" },
+    audio: false,
+  });
+  webcamEl.srcObject = stream;
+  await new Promise((resolve) => { webcamEl.onloadedmetadata = resolve; });
+}
+startWebcamBackground().catch((err) => console.error("webcam failed:", err));
 
 // ---- TODO 1.1b: a lit cube ----
-// - BoxGeometry(1,1,1) + MeshStandardMaterial (pick a color)
-// - AmbientLight (soft) + DirectionalLight (angled) — try removing each to SEE
-//   what they do. MeshStandardMaterial is black without lights. Why?
+// MeshStandardMaterial is a *physically based* material — it computes color
+// from how light reflects off the surface, so with zero lights in the scene
+// there's zero light to reflect and it renders pure black. (Contrast with
+// MeshBasicMaterial, which ignores lighting entirely and just shows flat color.)
+const cube = new THREE.Mesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardMaterial({ color: 0x4e8cff })
+);
+scene.add(cube);
 
-// ---- TODO 1.1c: animate ----
-// - render loop with requestAnimationFrame; rotate the cube a little each frame
-// - handle window 'resize': update camera.aspect + updateProjectionMatrix + renderer size
+const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambient);
+
+const directional = new THREE.DirectionalLight(0xffffff, 1.2);
+directional.position.set(3, 4, 5);
+scene.add(directional);
 
 // ---- TODO 1.2: transforms lab ----
-// - mousemove: map mouse x/y to cube position.x/y (you'll need to convert
-//   pixel coords → world coords; think about what the visible world width is at z=0)
-// - wheel: scale the cube up/down (clamp it)
-// - rotate with a quaternion: build one with setFromAxisAngle and multiply it
-//   into cube.quaternion each frame. Then ask Claude Code: "explain gimbal lock
-//   and why we'll use quaternions for the garment in Stage 3."
+
+// mousemove -> cube position (map screen pixels to world coords at z=0)
+// At distance D from the camera, a perspective camera's visible half-height
+// is D * tan(fov/2); half-width is that times the aspect ratio. Deriving
+// this from fov/aspect (rather than hardcoding numbers) keeps it correct
+// after resize.
+window.addEventListener("mousemove", (e) => {
+  const ndcX = (e.clientX / window.innerWidth) * 2 - 1;
+  const ndcY = -(e.clientY / window.innerHeight) * 2 + 1;
+
+  const dist = camera.position.z; // cube sits at z=0, camera looks at it from here
+  const halfHeight = dist * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const halfWidth = halfHeight * camera.aspect;
+
+  cube.position.x = ndcX * halfWidth;
+  cube.position.y = ndcY * halfHeight;
+});
+
+// wheel -> uniform scale, clamped
+const MIN_SCALE = 0.3;
+const MAX_SCALE = 3;
+window.addEventListener("wheel", (e) => {
+  const next = cube.scale.x - e.deltaY * 0.001;
+  const clamped = THREE.MathUtils.clamp(next, MIN_SCALE, MAX_SCALE);
+  cube.scale.setScalar(clamped);
+});
+
+// Quaternion rotation: build a small delta rotation each frame around a
+// fixed but non-axis-aligned axis, and compose it onto the cube's current
+// orientation via multiplication (order matters — this composes in the
+// cube's local frame). setFromAxisAngle takes a *normalized* axis vector.
+const rotAxis = new THREE.Vector3(1, 1, 0.3).normalize();
+const deltaQuat = new THREE.Quaternion().setFromAxisAngle(rotAxis, 0.015);
+
+// ---- TODO 1.1c: animate ----
+function animate() {
+  requestAnimationFrame(animate);
+  cube.quaternion.multiply(deltaQuat);
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
 
 // ---- TODO 1.3: glTF ----
 // - find any free .glb (e.g. Khronos sample models on GitHub), load with GLTFLoader
 // - normalize: use new THREE.Box3().setFromObject(model) to get its size, then
 //   scale so its largest dimension is 2 world units, and center it at origin.
 //   (This exact normalization idea reappears in the garment asset pipeline.)
+// This particular sample model uses Draco mesh compression, which plain
+// GLTFLoader can't decode on its own — it needs a DRACOLoader pointed at
+// the decoder (WASM) files, wired in via setDRACOLoader. Not every glTF
+// needs this, but it's common enough for real-world assets to be worth
+// having wired up now rather than hitting it as a surprise failure later.
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath(
+  "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/"
+);
+const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
 
-// ---- TODO 1.4: transparent overlay (the product's layer stack) ----
-// - new file or extend: put a <video> webcam feed (from Stage 0) behind this
-//   canvas via CSS (position:absolute stacking), create the renderer with
-//   { alpha: true }, and DON'T set scene.background.
-// - Acceptance: your cube floats over your live camera image.
-//   That layered structure IS MirrorFit's render architecture.
+gltfLoader.load(
+  "https://cdn.jsdelivr.net/gh/mrdoob/three.js/examples/models/gltf/duck.glb",
+  (gltf) => {
+    const model = gltf.scene;
+
+    // Source models come in whatever scale/units their author used — could
+    // be centimeters, meters, or arbitrary. Box3 measures the model's
+    // actual bounding box in world units so we can normalize it, the same
+    // way the garment pipeline will need to normalize inconsistent assets.
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    model.scale.setScalar(2 / maxDim);
+
+    // Re-measure after scaling — the bounding box center shifts once the
+    // model is scaled, so centering has to happen after, not before.
+    const centeredBox = new THREE.Box3().setFromObject(model);
+    const center = centeredBox.getCenter(new THREE.Vector3());
+    model.position.sub(center);
+    model.position.x -= 3; // offset sideways so it doesn't overlap the cube
+
+    scene.add(model);
+  },
+  undefined,
+  (err) => console.error("glTF load failed:", err)
+);
+
+// TODO 1.4 (webcam background + alpha renderer) implemented above, next to
+// the renderer/scene setup it modifies — see startWebcamBackground() and
+// the `alpha: true` renderer option.
 </script>
 </body>
 </html>
