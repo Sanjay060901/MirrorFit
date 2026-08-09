@@ -15,55 +15,372 @@
 <div id="stage">
   <video id="video" autoplay playsinline muted width="640" height="480"></video>
   <canvas id="overlay" width="640" height="480"></canvas>
+  <!-- 2D layer, above the WebGL garment canvas: draws the arm/hand cutout
+       so limbs crossing in front of the garment render on top of it. A
+       WebGL canvas can't also have a 2D context, hence a separate element. -->
+  <canvas id="occlusion" width="640" height="480"></canvas>
 </div>
-<div id="ui"><!-- garment picker buttons + snapshot button go here (task 3.4) --></div>
+<div id="ui">
+  <!-- garment picker buttons go here once there are 3 real assets -->
+  <button id="snapshotBtn">Snapshot</button>
+</div>
 
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
 <script type="module">
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import * as THREE from "three";
 import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
 // You are assembling everything you built in Stages 0–2 into the product.
 // Architecture (same as web/reference/glasses-tryon.html, body instead of face):
 //   camera → PoseLandmarker → filter → anchor garment plane → Three.js composite
 
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const occlusion = document.getElementById("occlusion");
+const occCtx = occlusion.getContext("2d");
+const W = 640, H = 480;
+
 // ---- TODO 3.1: rigid anchor ----
-// 1. Stage 1.4's setup: transparent Three.js canvas over the video, pixel-perfect
-//    camera trick (camera z = H/2 / tan(fov/2), 1 world unit = 1 pixel at z=0).
-// 2. A THREE.PlaneGeometry "torso proxy":
-//    - position: midpoint of shoulders(11,12) and hips(23,24), converted from
-//      normalized coords to pixel-world coords (Stage 0 skill)
-//    - width: shoulder pixel distance * ~1.15   height: shoulder-to-hip distance * ~1.4
-//    - roll: angle of the shoulder line (atan2) applied as rotation.z
-// 3. One-Euro filter (your Stage 2 class) on the anchor points, NOT the output.
-// Acceptance: a semi-transparent rectangle glued to your torso through lean/step.
+
+// camera — same enumerate-and-skip-IR pattern as Stage 0/2 and the reference file
+async function startCamera() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  const rgbCam = cams.find((d) => !/ir|infrared/i.test(d.label)) ?? cams[0];
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: rgbCam
+      ? { deviceId: { exact: rgbCam.deviceId }, width: W, height: H }
+      : { width: W, height: H, facingMode: "user" },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise((resolve) => { video.onloadedmetadata = resolve; });
+}
+
+// pose landmarker — same model/setup as Stage 2, minus segmentation (not needed until 3.3)
+let landmarker;
+async function loadLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+}
+
+// Three.js trio — transparent canvas bound to the existing #overlay element,
+// pixel-perfect camera trick from Stage 1.4 / the reference file: at this
+// z distance, 1 world unit = 1 pixel at the z=0 plane.
+const scene = new THREE.Scene();
+const FOV = 60;
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 1, 5000);
+camera.position.z = H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+
+// preserveDrawingBuffer: WebGL clears its buffer between frames by
+// default; without this, reading the canvas back for a snapshot (which
+// happens on a button click, well after the last render() call) could
+// capture a blank frame.
+const renderer = new THREE.WebGLRenderer({
+  canvas: overlay, alpha: true, antialias: true, preserveDrawingBuffer: true,
+});
+renderer.setSize(W, H);
 
 // ---- TODO 3.2: control-mesh warp ----
-// Replace the rigid plane with PlaneGeometry(w, h, 4, 6) — a grid with vertices.
-// Texture it with a garment PNG (make one: any t-shirt photo, background removed,
-// saved to web/assets/). Each frame, move specific vertices of geometry.attributes.position:
-//   top corners → shoulder landmarks; mid-edge verts → interpolated torso sides;
-//   bottom edge → hip line, extended for garment length.
-// Set position.needsUpdate = true after edits.
-// Ask Claude Code FIRST: "Explain how BufferGeometry position attributes work and
-// how vertex indices are laid out in a PlaneGeometry grid." Then implement.
-// Acceptance: the shirt bends when you lean sideways instead of staying rigid.
+// A 4x6-segment grid = 5x7 vertices. We rewrite every vertex's world
+// position each frame (see updateGarmentMesh below), so the mesh's own
+// position/rotation/scale stay at identity — unlike Stage 3.1's rigid
+// plane, which anchored via the *object's* transform. DoubleSide because
+// once vertices warp, a leaned mesh can briefly show its back face.
+const GRID_COLS = 4;
+const GRID_ROWS = 6;
+const garmentMat = new THREE.MeshBasicMaterial({
+  map: new THREE.TextureLoader().load("../assets/tshirt-green.png"),
+  transparent: true,
+  side: THREE.DoubleSide,
+});
+const garmentGeo = new THREE.PlaneGeometry(1, 1, GRID_COLS, GRID_ROWS);
+const torso = new THREE.Mesh(garmentGeo, garmentMat);
+torso.visible = false;
+scene.add(torso);
 
-// ---- TODO 3.3: occlusion + honesty fade ----
-// a) Segmentation mask (Stage 2.3) as occlusion: composite so your ARMS render in
-//    front of the garment when crossed. Simplest v1: draw the masked video pixels
-//    on a canvas layer ABOVE the garment for high-person-probability regions that
-//    are NOT torso. Discuss the approach with Claude Code before coding — there
-//    are several valid designs; choose one you can explain.
-// b) Yaw estimate from shoulder foreshortening (visible shoulder width vs its
-//    rolling max). Past ~35°, fade the garment material.opacity toward 0.
-// Acceptance: arms-crossed test passes; turning fades the garment gracefully.
+// Move every vertex to a bilinear blend of the 4 corners: shoulderL/R (top,
+// v=0) and hemL/R (bottom, v=1). This single formula is what produces every
+// behavior the TODO asked for at once — top row lands exactly on the
+// shoulder landmarks (u,v=0/0 and 1/0), bottom row exactly on the hem
+// (v=1), the left/right edge columns are pure straight-line interpolation
+// between their two corners (u=0 or u=1), and every interior vertex blends
+// smoothly between all four. PlaneGeometry lays vertices out row-by-row,
+// top-to-bottom, left-to-right — so vertex (row, col) sits at flat array
+// index `row * (GRID_COLS + 1) + col`.
+function updateGarmentMesh(shoulderL, shoulderR, hipL, hipR) {
+  // Hem extends past the hip line along the body's own shoulder->hip
+  // direction (not a fixed screen offset), so garment length stays
+  // correct as you lean or turn rather than drifting in screen space.
+  const shoulderMid = shoulderL.clone().add(shoulderR).multiplyScalar(0.5);
+  const hipMid = hipL.clone().add(hipR).multiplyScalar(0.5);
+  const hemOffset = hipMid.clone().sub(shoulderMid).multiplyScalar(0.6);
+  const hemL = hipL.clone().add(hemOffset);
+  const hemR = hipR.clone().add(hemOffset);
 
-// ---- TODO 3.4: ship it ----
-// - 3 garment PNGs + picker buttons; snapshot (composite video+overlay to a temp
-//   canvas → toDataURL → download link)
-// - Deploy: S3 static hosting + CloudFront (you know this part cold).
-// - Send the URL to 10 people. Write their feedback into docs/p1-feedback.md.
-// THIS COMPLETES P1. Update CLAUDE.md's "Current stage" and OPERATION_PLAN.md.
+  const pos = garmentGeo.attributes.position;
+  const vertsPerRow = GRID_COLS + 1;
+
+  for (let row = 0; row <= GRID_ROWS; row++) {
+    const v = row / GRID_ROWS;
+    for (let col = 0; col <= GRID_COLS; col++) {
+      const u = col / GRID_COLS;
+
+      const x =
+        (1 - u) * (1 - v) * shoulderL.x + u * (1 - v) * shoulderR.x +
+        (1 - u) * v * hemL.x + u * v * hemR.x;
+      const y =
+        (1 - u) * (1 - v) * shoulderL.y + u * (1 - v) * shoulderR.y +
+        (1 - u) * v * hemL.y + u * v * hemR.y;
+
+      pos.setXYZ(row * vertsPerRow + col, x, y, 0);
+    }
+  }
+  pos.needsUpdate = true; // BufferGeometry doesn't re-upload to the GPU on its own
+}
+
+// ---- TODO 3.3a: occlusion ----
+// Segmentation alone can't distinguish "arm" from "torso" (it's just
+// person-vs-background), which is exactly what the arms-crossed case needs
+// to tell apart — both are "person" wherever they overlap. Landmarks give
+// us something segmentation can't: the arm's actual joint chain. So: draw
+// a thick rounded stroke along shoulder->elbow->wrist (extended a bit past
+// the wrist to approximate the hand) using globalCompositeOperation
+// "source-in" to cut the real video out through that tube shape, then
+// layer that cutout above the garment mesh.
+const ARM_CHAINS = [
+  [11, 13, 15], // left shoulder -> elbow -> wrist
+  [12, 14, 16], // right shoulder -> elbow -> wrist
+];
+
+function drawArmOcclusion(f, shoulderDist) {
+  occCtx.clearRect(0, 0, W, H);
+  occCtx.globalCompositeOperation = "source-over";
+  occCtx.fillStyle = occCtx.strokeStyle = "#fff";
+  occCtx.lineWidth = shoulderDist * 0.32; // scales with body size, not a fixed pixel width
+  occCtx.lineCap = "round";
+  occCtx.lineJoin = "round";
+
+  for (const [shoulderIdx, elbowIdx, wristIdx] of ARM_CHAINS) {
+    const shoulder = f[shoulderIdx];
+    const elbow = f[elbowIdx];
+    const wrist = f[wristIdx];
+
+    // extend a bit past the wrist along the forearm direction, to roughly
+    // cover the hand too (we don't have separate hand landmarks here)
+    const handTip = {
+      x: wrist.x + (wrist.x - elbow.x) * 0.4,
+      y: wrist.y + (wrist.y - elbow.y) * 0.4,
+    };
+
+    occCtx.beginPath();
+    occCtx.moveTo(shoulder.x * W, shoulder.y * H);
+    occCtx.lineTo(elbow.x * W, elbow.y * H);
+    occCtx.lineTo(wrist.x * W, wrist.y * H);
+    occCtx.lineTo(handTip.x * W, handTip.y * H);
+    occCtx.stroke();
+  }
+
+  // Keep only the video pixels that fall within the white tube shape just
+  // drawn — this is what turns "a white tube" into "a cutout of your real
+  // arm," rather than requiring per-pixel mask math by hand.
+  occCtx.globalCompositeOperation = "source-in";
+  occCtx.drawImage(video, 0, 0, W, H);
+}
+
+// ---- TODO 3.3b: yaw estimate + honesty fade ----
+// Shoulder width foreshortens as you turn away from the camera — widest
+// when facing it square-on. We track the highest width seen so far as a
+// running "facing camera" baseline, then estimate yaw from how much
+// narrower the current width is relative to that peak. This is a rough
+// heuristic (acos of a width ratio), not real 3D pose estimation — good
+// enough to know roughly when to start fading, not to measure precisely.
+//
+// IMPORTANT: this must use worldLandmarks (metric, depth-corrected — same
+// reason Stage 2.4 used them for real measurements), not the pixel-space
+// landmarks used for anchoring. Pixel shoulder width changes both when you
+// turn AND when you simply move closer/further from the camera — using it
+// here would misread "stepped forward" as "turned," fading the garment on
+// ordinary movement.
+let maxShoulderWidthMeters = 0;
+const YAW_FADE_START_DEG = 35;
+const YAW_FADE_END_DEG = 60;
+
+function updateYawFade(shoulderWidthMeters) {
+  maxShoulderWidthMeters = Math.max(maxShoulderWidthMeters, shoulderWidthMeters);
+  if (maxShoulderWidthMeters === 0) return;
+
+  const ratio = THREE.MathUtils.clamp(shoulderWidthMeters / maxShoulderWidthMeters, 0, 1);
+  const yawDeg = THREE.MathUtils.radToDeg(Math.acos(ratio));
+
+  const fadeAmount = THREE.MathUtils.clamp(
+    (yawDeg - YAW_FADE_START_DEG) / (YAW_FADE_END_DEG - YAW_FADE_START_DEG),
+    0, 1
+  );
+  garmentMat.opacity = 1 - fadeAmount;
+}
+
+// One-Euro filter — same implementation as Stage 2 (see
+// web/stage2/pose-skeleton.html for the full explanation of what problem
+// this solves). We only need it for the 4 landmarks the anchor depends on.
+function smoothingFactor(dt, cutoff) {
+  const r = 2 * Math.PI * cutoff * dt;
+  return r / (r + 1);
+}
+class LowPassFilter {
+  filter(value, alpha) {
+    this.y = this.initialized ? alpha * value + (1 - alpha) * this.y : value;
+    this.initialized = true;
+    return this.y;
+  }
+}
+class OneEuroFilter {
+  constructor({ minCutoff = 1.2, beta = 0.02, dCutoff = 1.0 } = {}) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xFilter = new LowPassFilter();
+    this.dxFilter = new LowPassFilter();
+    this.lastValue = null;
+    this.lastTime = null;
+  }
+  filter(value, timestampMs) {
+    if (this.lastTime === null) {
+      this.lastTime = timestampMs;
+      this.lastValue = value;
+      return this.xFilter.filter(value, 1);
+    }
+    const dt = Math.max((timestampMs - this.lastTime) / 1000, 1 / 240);
+    this.lastTime = timestampMs;
+    const dValue = (value - this.lastValue) / dt;
+    this.lastValue = value;
+    const edValue = this.dxFilter.filter(dValue, smoothingFactor(dt, this.dCutoff));
+    const cutoff = this.minCutoff + this.beta * Math.abs(edValue);
+    return this.xFilter.filter(value, smoothingFactor(dt, cutoff));
+  }
+}
+
+// Filtering happens on the RAW landmark positions (the anchor points), not
+// on the derived width/height/angle. Filtering an angle directly is also
+// fragile near the +-180deg wraparound — deriving it from already-smoothed
+// points sidesteps that entirely.
+const ANCHOR_INDICES = [11, 12, 23, 24, 13, 14, 15, 16]; // shoulders, hips, elbows, wrists
+// beta higher than Stage 2's default (0.02): the torso anchor tracks real
+// lean/step motion, not just near-rest jitter, so the cutoff needs to ramp
+// up more per unit of estimated speed or lag becomes visible on real moves.
+const ANCHOR_FILTER_OPTS = { minCutoff: 1.5, beta: 0.4 };
+const anchorFilters = {};
+for (const i of ANCHOR_INDICES) {
+  anchorFilters[i] = {
+    x: new OneEuroFilter(ANCHOR_FILTER_OPTS),
+    y: new OneEuroFilter(ANCHOR_FILTER_OPTS),
+  };
+}
+
+function toWorld(nx, ny) {
+  return new THREE.Vector2((nx - 0.5) * W, -(ny - 0.5) * H);
+}
+
+let lastVideoTime = -1;
+function loop() {
+  requestAnimationFrame(loop);
+  if (!landmarker || video.readyState < 2) return;
+
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, performance.now());
+
+    if (result.landmarks?.length) {
+      const lms = result.landmarks[0];
+      const now = performance.now();
+
+      const f = {};
+      for (const i of ANCHOR_INDICES) {
+        f[i] = {
+          x: anchorFilters[i].x.filter(lms[i].x, now),
+          y: anchorFilters[i].y.filter(lms[i].y, now),
+        };
+      }
+
+      const ls = toWorld(f[11].x, f[11].y); // left shoulder
+      const rs = toWorld(f[12].x, f[12].y); // right shoulder
+      const lh = toWorld(f[23].x, f[23].y); // left hip
+      const rh = toWorld(f[24].x, f[24].y); // right hip
+      const shoulderDist = ls.distanceTo(rs); // pixel-space — fine for on-screen arm-tube width
+
+      updateGarmentMesh(ls, rs, lh, rh);
+      if (result.worldLandmarks?.length) {
+        const wl = result.worldLandmarks[0];
+        const shoulderWidthMeters = Math.hypot(
+          wl[11].x - wl[12].x, wl[11].y - wl[12].y, wl[11].z - wl[12].z
+        );
+        updateYawFade(shoulderWidthMeters);
+      }
+      torso.visible = true;
+      drawArmOcclusion(f, shoulderDist);
+    } else {
+      torso.visible = false;
+      occCtx.clearRect(0, 0, W, H);
+    }
+  }
+
+  // #occlusion sits above #overlay in the DOM (see the CSS), so it always
+  // paints on top regardless of which canvas's JS drew first this frame —
+  // these are two independent canvas elements, not one shared buffer.
+  renderer.render(scene, camera);
+}
+
+// ---- TODO 3.4: snapshot ----
+// video/overlay/occlusion are all CSS-mirrored (scaleX(-1)) for display,
+// but none of their own pixel buffers are actually flipped — so to save
+// an image matching what you SEE on screen, we mirror here too while
+// compositing them onto a temp canvas.
+document.getElementById("snapshotBtn").addEventListener("click", () => {
+  const temp = document.createElement("canvas");
+  temp.width = W;
+  temp.height = H;
+  const tctx = temp.getContext("2d");
+
+  tctx.translate(W, 0);
+  tctx.scale(-1, 1);
+  tctx.drawImage(video, 0, 0, W, H);
+  tctx.drawImage(overlay, 0, 0, W, H);
+  tctx.drawImage(occlusion, 0, 0, W, H);
+
+  const link = document.createElement("a");
+  link.download = `mirrorfit-snapshot-${Date.now()}.png`;
+  link.href = temp.toDataURL("image/png");
+  link.click();
+});
+
+// ---- boot ----
+(async () => {
+  await startCamera();
+  await loadLandmarker();
+  loop();
+})();
+
+// Garment picker (3.4's other piece) is on hold until there are 3 real
+// garment PNGs in web/assets/ — currently just tshirt-green.png.
+// Deploy (S3+CloudFront) is also deferred — real AWS cost, discuss before
+// provisioning anything.
 </script>
 </body>
 </html>

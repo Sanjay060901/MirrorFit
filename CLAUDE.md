@@ -1,11 +1,18 @@
 # MirrorFit — Full-body virtual try-on + brand-aware fit engine
 
 ## What this is
-Browser-based AR apparel try-on: MediaPipe Pose + Segmentation (WASM, on-device)
-drive a Three.js render layer over the live camera; a fit engine maps measured
-body landmarks against per-brand size charts to recommend sizes. Backend is
-FastAPI + Postgres + S3/CloudFront, deployed with AWS CDK. Later phases package
-the same web app as an in-store smart-mirror kiosk (QR/RFID-triggered).
+Live 3D virtual try-on: a parametric body twin (SMPL-family) fitted to the
+shopper and posed from MediaPipe Pose, wearing pattern-graded garments
+simulated with a GPU XPBD cloth solver — so wrong-size behavior (pulling,
+gaping, pooling) is emergent physics, not a scripted effect. A fit engine maps
+measured landmarks against per-brand size charts. Backend is FastAPI +
+Postgres + S3/CloudFront, deployed with AWS CDK. Later phases package it as an
+in-store smart-mirror kiosk (QR/RFID-triggered, real GPU, depth camera).
+
+**Architecture pivot 2026-08-10** — see OPERATION_PLAN.md Part II. The earlier
+"Tier 1 flat PNG warp" framing is superseded: it's now a learning step and
+possible degraded phone tier, not the product. Realistic cost of the new
+target: ~18–24 months to pilot at a part-time solo pace.
 
 - Master plan: docs/OPERATION_PLAN.md  ← always check current stage/task there
 - Full spec: docs/MirrorFit_Advanced_Documentation.pdf
@@ -17,6 +24,9 @@ Stage 3 (see OPERATION_PLAN.md). Update this line as stages complete.
 
 ## How to work with me (IMPORTANT — I am learning this stack)
 - I know Python/FastAPI/AWS/DevOps well. I am LEARNING JS, Three.js, MediaPipe, 3D math.
+- The Part II architecture also requires: linear algebra for skinning, GPU
+  compute shaders (WebGPU), cloth simulation theory, and CLO3D pattern
+  authoring. Assume I'm new to all four — teach before building.
 - Write the implementation directly rather than leaving TODOs for me to fill in —
   we moved off the skeleton-first workflow because in practice I kept asking you
   to just implement it.

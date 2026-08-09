@@ -7,3 +7,5 @@ venv/
 cdk.out/
 .DS_Store
 docs/p1-feedback.md
+.claude/settings.json
+.claude/settings.local.json
