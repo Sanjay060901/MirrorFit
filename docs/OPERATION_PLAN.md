@@ -118,10 +118,11 @@ compositing) — all of which Stages 5–7 build on — then move on.
 
 ## The four pillars
 
-1. **3D body twin, tracked live** — a parametric human mesh (SMPL/SMPL-X
-   family): ~10 shape parameters fitted from the measured vector + segmentation
-   silhouette, posed live from tracked landmarks. Gives volume instead of a
-   skeleton, and solves occlusion for free (render depth-only as a mask).
+1. **3D body twin, tracked live** — a parametric human mesh (**Anny**, see
+   licensing note in Stage 5): shape parameters fitted from the measured
+   vector + segmentation silhouette, posed live from tracked landmarks. Gives
+   volume instead of a skeleton, and solves occlusion for free (render
+   depth-only as a mask).
 2. **Pattern-true garments, graded per size** — don't model "the dress," model
    *each size* from its real graded pattern (CLO3D/Marvelous Designer), with
    measured fabric properties (stretch, weight, bending stiffness). Size M is
@@ -134,21 +135,40 @@ compositing) — all of which Stages 5–7 build on — then move on.
    live tension view (tinted where fabric is at stretch limit). This is the
    demo that differentiates from every flat-overlay competitor.
 
-## Stage 5 — SMPL body twin (fitting + live driving)
+## Stage 5 — Body twin (fitting + live driving)
 
-- [ ] **5.1 Linear algebra + skinning fundamentals** — learn LBS (linear blend
-      skinning), joint hierarchies, blend shapes. No product code yet.
-- [ ] **5.2 Load and pose a body model** — get an SMPL-family mesh rendering;
-      pose it from hardcoded joint rotations, then from live Stage 2 landmarks
-- [ ] **5.3 Shape fitting** — fit shape params from the Stage 2.4 measurement
-      vector + segmentation silhouette; stabilize across frames
-- [ ] **5.4 Depth-only occlusion** — render the twin to a depth mask so real
+- [x] **5.1 Linear algebra + skinning fundamentals** — LBS, joint hierarchies,
+      blend shapes. Built by hand in `web/stage5/skinning-basics.html`:
+      two-bone cylinder, manual skin weights, visible blend band, candy-wrapper
+      artifact on twist.
+- [ ] **5.2 Export Anny to glTF** — Anny ships as a Python package; bake mesh +
+      skeleton + blendshapes to glTF (native support for skinning and morph
+      targets) so Three.js can load it. Verify morph targets survive the export.
+- [ ] **5.3 Load and pose the body model** — render the twin; pose from
+      hardcoded joint rotations first, then from live Stage 2 landmarks
+- [ ] **5.4 Shape fitting** — fit shape params from the Stage 2.4 measurement
+      vector + segmentation silhouette; stabilize across frames. Anny's params
+      are interpretable (age/height/weight/muscle), so this maps more directly
+      than SMPL's abstract PCA components would have.
+- [ ] **5.5 Depth-only occlusion** — render the twin to a depth mask so real
       limbs correctly occlude anything drawn behind them
 - Acceptance: an invisible, metrically-plausible 3D body moves with you in
   camera space; occlusion works without the Stage 3.3 arm-tube hack
-- **Licensing gate:** SMPL/SMPL-X have specific licenses (research vs
-  commercial). Resolve which model family is legally usable for a commercial
-  product BEFORE building on it — this can invalidate the whole approach.
+
+### Licensing gate — RESOLVED 2026-08-12
+
+**SMPL/SMPL-X are ruled out.** Non-commercial research license only;
+commercial use requires sublicensing via Meshcapade, whose pricing was never
+public and who were acquired by Epic Games in early 2026 — opaque terms, in
+flux. Not a safe foundation for a commercial product.
+
+**Chosen: Anny** (Naver Labs Europe) — https://github.com/naver/anny
+- Apache 2.0, commercial use unrestricted
+- ~13k verts, 163 bones, 564 interpretable artist-defined blendshapes
+- Pose via per-joint rotations + blend skinning (the LBS from 5.1)
+- Ships mappings to/from SMPL-X, so SMPL-X-targeting research and pretrained
+  pose estimators remain usable
+- Caveat: Python package, hence the 5.2 export step
 
 ## Stage 6 — XPBD cloth solver
 

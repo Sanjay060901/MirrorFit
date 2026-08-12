@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 5.1 — Skinning fundamentals (LBS)</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui {
+    position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.65);
+    padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.7;
+  }
+  #ui label { display: block; }
+  input[type=range] { width: 200px; vertical-align: middle; }
+  .key { color: #7ab; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>bend <input id="bend" type="range" min="-90" max="90" value="0" /> <span id="bendVal">0°</span></label>
+  <label>twist <input id="twist" type="range" min="-180" max="180" value="0" /> <span id="twistVal">0°</span></label>
+  <div><span class="key">w</span> toggle weight colors · <span class="key">s</span> toggle skeleton · <span class="key">m</span> toggle wireframe</div>
+  <div id="mode" style="color:#8c8">showing: weight colors</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+// ---- Stage 5.1: Linear Blend Skinning, made visible ----
+//
+// The whole point of this file: a mesh has thousands of vertices, a skeleton
+// has a handful of joints. Skinning is the rule that says how joint motion
+// moves vertices. Under LBS every vertex carries a list of (joint, weight)
+// pairs summing to 1, and lands at the weighted average of where each
+// influencing joint would independently put it:
+//
+//   v' = Σ( wᵢ · Jᵢ · Bᵢ⁻¹ · v )
+//
+//   v   = vertex in bind pose (the rest position the mesh was authored in)
+//   Bᵢ⁻¹ = inverse bind matrix — maps v from world space INTO joint i's local
+//         space. This is the piece people get wrong: without it you'd be
+//         applying the joint's full world transform on top of a vertex that
+//         already sits in world space, double-transforming it.
+//   Jᵢ  = joint i's CURRENT world transform
+//   wᵢ  = how much joint i influences this vertex
+//
+// Three.js does this on the GPU for you once you supply skinIndex/skinWeight
+// attributes and call .bind(). We build those by hand here so the numbers
+// aren't a black box.
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(3, 1.5, 5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+dir.position.set(3, 5, 4);
+scene.add(dir);
+
+// ---- 1. Geometry ----
+// heightSegments matters a lot: it's how many RINGS of vertices exist along
+// the cylinder. Too few and there's nothing in the blend band to bend
+// smoothly — the deformation looks like a hinge instead of a bend. This is
+// also why real body meshes are denser at elbows/knees than on flat panels.
+const HEIGHT = 4;
+const RADIAL_SEGMENTS = 24;
+const HEIGHT_SEGMENTS = 40;
+const geometry = new THREE.CylinderGeometry(
+  0.5, 0.5, HEIGHT, RADIAL_SEGMENTS, HEIGHT_SEGMENTS
+);
+
+// ---- 2. Bones (the joint hierarchy) ----
+// Two bones in a parent->child chain. Bone positions are LOCAL to their
+// parent, which is what makes a hierarchy work: rotating the parent carries
+// the child along automatically (same reason rotating your shoulder moves
+// your whole forearm without the elbow doing anything).
+const boneRoot = new THREE.Bone();
+boneRoot.position.y = -HEIGHT / 2;        // world y = -2 (bottom of cylinder)
+
+const boneMid = new THREE.Bone();
+boneMid.position.y = HEIGHT / 2;          // local +2 from parent -> world y = 0 (middle)
+boneRoot.add(boneMid);
+
+const bones = [boneRoot, boneMid];
+const skeleton = new THREE.Skeleton(bones);
+
+// ---- 3. Skin weights ----
+// For each vertex we decide how much each bone influences it, based on where
+// it sits along the cylinder's height. The interesting part is the BLEND BAND
+// in the middle: outside it a vertex belongs entirely to one bone (weight 1),
+// inside it the weights ramp between them. A wide band gives a soft, smeared
+// bend; a narrow band gives a sharp crease. That tradeoff is the whole art of
+// weight painting.
+const BLEND_START = 0.42;  // as a fraction of height, where bone1's influence begins
+const BLEND_END = 0.58;    // where it becomes total
+
+const position = geometry.attributes.position;
+const skinIndices = [];
+const skinWeights = [];
+const colors = [];
+
+for (let i = 0; i < position.count; i++) {
+  const y = position.getY(i);
+  const t = (y + HEIGHT / 2) / HEIGHT;      // 0 at bottom, 1 at top
+
+  // smoothstep across the blend band -> weight for the upper bone
+  const raw = THREE.MathUtils.clamp(
+    (t - BLEND_START) / (BLEND_END - BLEND_START), 0, 1
+  );
+  const wUpper = raw * raw * (3 - 2 * raw); // smoothstep: eases in/out instead of a linear ramp
+  const wLower = 1 - wUpper;                // MUST sum to 1, or the vertex scales as bones move
+
+  // Three.js always stores 4 influences per vertex (a GPU-friendly fixed
+  // size). We only use 2 here, so the remaining slots get weight 0.
+  skinIndices.push(0, 1, 0, 0);
+  skinWeights.push(wLower, wUpper, 0, 0);
+
+  // visualize: red = fully lower bone, blue = fully upper, purple = blended
+  colors.push(wLower, 0.15, wUpper);
+}
+
+geometry.setAttribute("skinIndex", new THREE.Uint16BufferAttribute(skinIndices, 4));
+geometry.setAttribute("skinWeight", new THREE.Float32BufferAttribute(skinWeights, 4));
+geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+
+// ---- 4. Bind ----
+// .bind() is the moment the CURRENT bone transforms get recorded as the bind
+// pose, and their inverses cached as the inverse bind matrices. Everything
+// after this is measured as a deviation from this instant — which is why you
+// bind BEFORE posing, never after.
+const material = new THREE.MeshStandardMaterial({
+  vertexColors: true, roughness: 0.6, metalness: 0.0,
+});
+const mesh = new THREE.SkinnedMesh(geometry, material);
+mesh.add(boneRoot);     // the bone tree must be part of the mesh's own hierarchy
+mesh.bind(skeleton);
+scene.add(mesh);
+
+const helper = new THREE.SkeletonHelper(mesh);
+scene.add(helper);
+
+// ---- 5. Drive the joint ----
+// Rotating boneMid rotates every vertex weighted to it, around boneMid's
+// position (world y = 0). Vertices in the blend band get partially carried,
+// which is what produces a curve instead of a hinge.
+const bendEl = document.getElementById("bend");
+const twistEl = document.getElementById("twist");
+const bendValEl = document.getElementById("bendVal");
+const twistValEl = document.getElementById("twistVal");
+
+function applyPose() {
+  const bendDeg = Number(bendEl.value);
+  const twistDeg = Number(twistEl.value);
+  bendValEl.textContent = `${bendDeg}°`;
+  twistValEl.textContent = `${twistDeg}°`;
+
+  // bend around Z (sideways), twist around Y (the cylinder's own axis).
+  // Twist is the interesting one — see the note on candy-wrapper below.
+  boneMid.rotation.set(0, THREE.MathUtils.degToRad(twistDeg), THREE.MathUtils.degToRad(bendDeg));
+}
+bendEl.addEventListener("input", applyPose);
+twistEl.addEventListener("input", applyPose);
+applyPose();
+
+// ---- 6. View toggles ----
+const modeEl = document.getElementById("mode");
+let showWeights = true;
+addEventListener("keydown", (e) => {
+  if (e.key === "w") {
+    showWeights = !showWeights;
+    material.vertexColors = showWeights;
+    material.color.set(showWeights ? 0xffffff : 0x6699cc);
+    material.needsUpdate = true;
+    modeEl.textContent = showWeights ? "showing: weight colors" : "showing: plain shading";
+  }
+  if (e.key === "s") helper.visible = !helper.visible;
+  if (e.key === "m") material.wireframe = !material.wireframe;
+});
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---- What to actually look for ----
+// 1. Bend to ~90°. The curve happens ONLY in the purple blend band. Red and
+//    blue regions stay rigid — they're fully owned by one bone each.
+// 2. Twist to ~180°. Watch the blend band pinch inward and lose volume: this
+//    is the "candy wrapper" artifact, and it is NOT a bug. It's inherent to
+//    averaging MATRICES linearly — halfway between "rotated 0°" and "rotated
+//    180°" is close to a degenerate/collapsed transform, not "rotated 90°".
+//    Dual quaternion skinning exists specifically to fix this.
+// 3. Widen the blend band (BLEND_START/END closer to 0.2/0.8) and reload:
+//    smoother bend, worse volume loss. Narrow it: sharper crease, less
+//    smearing. There is no universally correct answer — that's weight painting.
+</script>
+</body>
+</html>
