@@ -141,9 +141,14 @@ compositing) — all of which Stages 5–7 build on — then move on.
       blend shapes. Built by hand in `web/stage5/skinning-basics.html`:
       two-bone cylinder, manual skin weights, visible blend band, candy-wrapper
       artifact on twist.
-- [ ] **5.2 Export Anny to glTF** — Anny ships as a Python package; bake mesh +
-      skeleton + blendshapes to glTF (native support for skinning and morph
-      targets) so Three.js can load it. Verify morph targets survive the export.
+- [x] **5.2a Export Anny to glTF (skinned, fixed shape)** —
+      `scripts/bodytwin/export_anny_gltf.py`. Handles Z-up→Y-up and prunes
+      9 bone influences to glTF's 4 (mean weight dropped 0.005, worst vertex
+      0.22). Verified posing in `web/stage5/bodytwin-viewer.html`. 0.84 MB.
+- [ ] **5.2b Add morph targets for live shape** — REQUIRED, not optional:
+      a new shopper must get their own twin from the camera, so shape has to
+      be settable in-browser. Measured linearity (see note below) says this
+      works with a small number of targets.
 - [ ] **5.3 Load and pose the body model** — render the twin; pose from
       hardcoded joint rotations first, then from live Stage 2 landmarks
 - [ ] **5.4 Shape fitting** — fit shape params from the Stage 2.4 measurement
@@ -154,6 +159,35 @@ compositing) — all of which Stages 5–7 build on — then move on.
       limbs correctly occlude anything drawn behind them
 - Acceptance: an invisible, metrically-plausible 3D body moves with you in
   camera space; occlusion works without the Stage 3.3 arm-tube hack
+
+### Measured: Anny phenotype linearity (2026-08-13)
+
+Morph targets blend linearly, so this decides whether shape can be fitted
+in-browser (instant, no backend) or must run server-side. Error at the
+midpoint vs. a linear blend of the endpoints, on a 1.625 m reference:
+
+| param       | max err | verdict |
+|-------------|---------|---------|
+| proportions | 0.3 mm  | linear  |
+| height      | 2.4 mm  | linear  |
+| gender      | 2.5 mm  | linear  |
+| weight      | 6.2 mm  | linear  |
+| muscle      | 12.4 mm | linear  |
+| age         | 221 mm  | **non-linear** |
+
+Params are also **separable**: height+weight applied additively differs from
+the true combination by 0.45 mm max. So targets compose; we don't need every
+combination baked.
+
+`age` stays non-linear within adult sub-ranges too ([0.5,1.0] → 62 mm,
+[0.6,1.0] → 25 mm), because child→adult changes proportions qualitatively.
+Handle it piecewise: sample a few points along age and blend between the
+neighbours. Interpolation error falls ~quadratically as intervals narrow, so
+2–3 adult-range segments lands under ~6 mm.
+
+**Consequence:** shape fitting is a client-side solve for morph weights from
+the Stage 2.4 measurement vector. No per-shopper server round-trip, and the
+kiosk keeps working if the network drops.
 
 ### Licensing gate — RESOLVED 2026-08-12
 

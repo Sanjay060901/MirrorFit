@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 5.2 — Body twin viewer (Anny → glTF)</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui {
+    position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.7);
+    padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.7;
+    max-height: 92vh; overflow-y: auto;
+  }
+  select, input[type=range] { vertical-align: middle; }
+  select { width: 190px; }
+  input[type=range] { width: 150px; }
+  .key { color: #7ab; font-weight: 600; }
+  #stats { color: #8c8; margin-top: 6px; }
+  #err { color: #f77; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Stage 5.2 — body twin</b></div>
+  <div id="stats">loading…</div>
+  <div id="err"></div>
+  <hr style="border-color:#333" />
+  <label>bone <select id="boneSel"></select></label>
+  <div>
+    <label>x <input id="rx" type="range" min="-90" max="90" value="0" /> <span id="rxv">0°</span></label>
+    <label>y <input id="ry" type="range" min="-90" max="90" value="0" /> <span id="ryv">0°</span></label>
+    <label>z <input id="rz" type="range" min="-90" max="90" value="0" /> <span id="rzv">0°</span></label>
+  </div>
+  <div><button id="reset">reset pose</button></div>
+  <hr style="border-color:#333" />
+  <div><span class="key">s</span> skeleton · <span class="key">m</span> wireframe</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+// Stage 5.2 — verify the exported body twin actually skins in the browser.
+//
+// This is the acceptance test for scripts/bodytwin/export_anny_gltf.py. If
+// the bind pose or inverse bind matrices are wrong, it shows up immediately
+// and unmistakably: the mesh explodes, collapses to a point, or limbs detach
+// when you rotate a bone. A static mesh that merely *looks* right proves
+// nothing — you have to pose it.
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.0, 3.2);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 1.15);
+key.position.set(2, 4, 3);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x88aacc, 0.5);
+rim.position.set(-3, 2, -2);
+scene.add(rim);
+
+scene.add(new THREE.GridHelper(4, 16, 0x333333, 0x222222));
+
+const statsEl = document.getElementById("stats");
+const errEl = document.getElementById("err");
+const boneSel = document.getElementById("boneSel");
+
+let skinned = null;
+let helper = null;
+let material = null;
+const restRotations = new Map();
+
+new GLTFLoader().load(
+  "../assets/bodytwin.glb",
+  (gltf) => {
+    gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+
+    if (!skinned) {
+      errEl.textContent = "loaded, but no SkinnedMesh found — the skin/joints didn't export.";
+      return;
+    }
+
+    material = new THREE.MeshStandardMaterial({
+      color: 0xb0b6bd, roughness: 0.75, metalness: 0.05,
+      skinning: true, // no-op in r160 (auto-detected) but explicit about intent
+    });
+    skinned.material = material;
+
+    // The export bakes the model standing on its own origin; drop it so the
+    // feet sit on the grid, purely so the viewer reads naturally.
+    const box = new THREE.Box3().setFromObject(gltf.scene);
+    gltf.scene.position.y -= box.min.y;
+
+    scene.add(gltf.scene);
+
+    helper = new THREE.SkeletonHelper(skinned);
+    scene.add(helper);
+
+    const bones = skinned.skeleton.bones;
+    bones.forEach((b, i) => {
+      restRotations.set(b, b.rotation.clone());
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = `${i}: ${b.name}`;
+      boneSel.appendChild(opt);
+    });
+
+    // default to a shoulder if present — the most legible joint to test
+    const shoulderIdx = bones.findIndex((b) => /upperarm.*L|shoulder.*L/i.test(b.name));
+    if (shoulderIdx >= 0) boneSel.value = String(shoulderIdx);
+
+    const size = box.getSize(new THREE.Vector3());
+    statsEl.innerHTML =
+      `verts ${skinned.geometry.attributes.position.count.toLocaleString()} · ` +
+      `bones ${bones.length}<br>height ${size.y.toFixed(3)} m`;
+  },
+  undefined,
+  (e) => {
+    errEl.textContent = "failed to load bodytwin.glb — run scripts/bodytwin/export_anny_gltf.py first.";
+    console.error(e);
+  }
+);
+
+// ---- pose controls ----
+const rx = document.getElementById("rx");
+const ry = document.getElementById("ry");
+const rz = document.getElementById("rz");
+const rxv = document.getElementById("rxv");
+const ryv = document.getElementById("ryv");
+const rzv = document.getElementById("rzv");
+
+function currentBone() {
+  if (!skinned) return null;
+  return skinned.skeleton.bones[Number(boneSel.value)] ?? null;
+}
+
+function applyRotation() {
+  const bone = currentBone();
+  if (!bone) return;
+  const rest = restRotations.get(bone);
+  rxv.textContent = `${rx.value}°`;
+  ryv.textContent = `${ry.value}°`;
+  rzv.textContent = `${rz.value}°`;
+  // Offset from the REST rotation, not absolute — otherwise selecting a bone
+  // that isn't at identity would snap it before you touched anything.
+  bone.rotation.set(
+    rest.x + THREE.MathUtils.degToRad(Number(rx.value)),
+    rest.y + THREE.MathUtils.degToRad(Number(ry.value)),
+    rest.z + THREE.MathUtils.degToRad(Number(rz.value))
+  );
+}
+
+[rx, ry, rz].forEach((el) => el.addEventListener("input", applyRotation));
+
+boneSel.addEventListener("change", () => {
+  rx.value = ry.value = rz.value = "0";
+  applyRotation();
+});
+
+document.getElementById("reset").addEventListener("click", () => {
+  if (!skinned) return;
+  for (const [bone, rest] of restRotations) bone.rotation.copy(rest);
+  rx.value = ry.value = rz.value = "0";
+  rxv.textContent = ryv.textContent = rzv.textContent = "0°";
+});
+
+addEventListener("keydown", (e) => {
+  if (e.key === "s" && helper) helper.visible = !helper.visible;
+  if (e.key === "m" && material) material.wireframe = !material.wireframe;
+});
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>

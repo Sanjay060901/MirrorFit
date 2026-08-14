@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 5.3 — Body twin driven by live pose</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif;
+         display: grid; place-items: center; min-height: 100vh; }
+  #stage { position: relative; width: 640px; height: 480px; }
+  #video, #twin { position: absolute; top: 0; left: 0; width: 640px; height: 480px; }
+  #video { transform: scaleX(-1); }
+  #ui { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.75);
+        padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.8; }
+  #ui label { display: block; }
+  #status { color: #8c8; }
+  .key { color: #7ab; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Stage 5.3 — live body twin</b></div>
+  <div id="status">loading…</div>
+  <hr style="border-color:#333" />
+  <label>video <input type="range" id="vopacity" min="0" max="100" value="100" /></label>
+  <label>twin <input type="range" id="topacity" min="0" max="100" value="70" /></label>
+  <div>shape: <span id="fit" style="color:#8cf">fitting…</span></div>
+  <div><button id="refit">re-fit shape</button></div>
+  <div><span class="key">s</span> skeleton · <span class="key">m</span> wireframe</div>
+</div>
+
+<div id="stage">
+  <video id="video" autoplay playsinline muted width="640" height="480"></video>
+  <canvas id="twin" width="640" height="480"></canvas>
+  <canvas id="dots" width="640" height="480" style="position:absolute;top:0;left:0"></canvas>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---- Stage 5.3: drive the body twin from live pose, auto-aligned ----
+//
+// Two separate problems, solved with two different landmark sets — this split
+// is the thing to understand:
+//
+//   POSE  (which way limbs point)  <- worldLandmarks: metric, hip-centred,
+//         camera-distance invariant, so joint angles are stable whether you
+//         stand near or far.
+//
+//   ALIGN (where on screen, how big) <- normalized image landmarks: these ARE
+//         camera-relative, which is exactly what you want for overlaying.
+//
+// Using worldLandmarks for alignment would put the twin in metres-from-hip
+// space with no idea where you are in frame; using image landmarks for pose
+// would make joint angles change as you walk toward the camera. Neither set
+// does both jobs.
+//
+// KNOWN LIMITS (not papered over):
+//  - Only 8 bones driven: upper/lower arms and legs. The torso does not yaw,
+//    so the twin always faces the camera however you turn.
+//  - No forearm twist. A single direction vector cannot determine roll about
+//    a bone's own axis; that needs hand landmarks or a heuristic.
+//  - Shape is still the default body, not yours — that is 5.2b + 5.4.
+
+const video = document.getElementById("video");
+const twinCanvas = document.getElementById("twin");
+const statusEl = document.getElementById("status");
+const W = 640, H = 480;
+
+async function startCamera() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  const rgb = cams.find((d) => !/ir|infrared/i.test(d.label)) ?? cams[0];
+
+  // `ideal` rather than exact sizes: demanding an exact resolution from a
+  // specific device throws OverconstrainedError on cameras that don't offer
+  // that mode. Try the chosen device first, then fall back to any camera.
+  const attempts = [];
+  if (rgb) {
+    attempts.push({
+      deviceId: { exact: rgb.deviceId },
+      width: { ideal: W }, height: { ideal: H },
+    });
+  }
+  attempts.push({ width: { ideal: W }, height: { ideal: H }, facingMode: "user" });
+  attempts.push(true); // last resort: any video at all
+
+  let stream = null, lastErr = null;
+  for (const constraint of attempts) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: constraint, audio: false });
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!stream) throw lastErr;
+
+  video.srcObject = stream;
+  await new Promise((r) => { video.onloadedmetadata = r; });
+}
+
+let landmarker;
+async function loadLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    // Looser than default: we'd rather track a partially-visible body with
+    // some uncertainty than show nothing at all. The One-Euro-style smoothing
+    // downstream absorbs the extra noise.
+    minPoseDetectionConfidence: 0.3,
+    minPosePresenceConfidence: 0.3,
+    minTrackingConfidence: 0.3,
+  });
+}
+
+// ---- scene: pixel-perfect camera (Stage 1.4 / Stage 3 trick) ----
+// At this z distance, 1 world unit == 1 screen pixel on the z=0 plane, so
+// alignment maths can be done directly in pixels.
+const scene = new THREE.Scene();
+const FOV = 60;
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 1, 5000);
+camera.position.z = H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+
+const renderer = new THREE.WebGLRenderer({ canvas: twinCanvas, alpha: true, antialias: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.05);
+keyLight.position.set(0.5, 2, 3);
+scene.add(keyLight);
+
+// ---- body twin ----
+// alignGroup owns placement/scale/roll; the model sits inside it offset so
+// its hips are exactly at the group origin. Keeping those concerns in
+// separate objects means the retargeting never has to know about screen
+// space, and alignment never has to know about bones.
+const alignGroup = new THREE.Group();
+scene.add(alignGroup);
+
+let skinned = null, helper = null, material = null, twinModel = null;
+// Not const: shape fitting changes the model's torso, and this is the divisor
+// for the pixels-per-metre alignment scale. See recentreHips().
+let twinTorsoMetres = 0;
+const restDirs = new Map();
+const boneByName = new Map();
+const plan = [];
+
+// Match THREE.PropertyBinding's reserved-character set, so a name we ask for
+// resolves to the same key as the loaded bone's sanitised name.
+const norm = (s) => s.replace(/[\[\]\.:\/]/g, "");
+
+const DRIVEN = [
+  ["upperarm01.L", "lowerarm01.L", 11, 13],
+  ["lowerarm01.L", "wrist.L",      13, 15],
+  ["upperarm01.R", "lowerarm01.R", 12, 14],
+  ["lowerarm01.R", "wrist.R",      14, 16],
+  ["upperleg01.L", "lowerleg01.L", 23, 25],
+  ["lowerleg01.L", "foot.L",       25, 27],
+  ["upperleg01.R", "lowerleg01.R", 24, 26],
+  ["lowerleg01.R", "foot.R",       26, 28],
+  // Hands. MediaPipe Pose does give a few hand points (17/18 pinky,
+  // 19/20 index, 21/22 thumb) — not full articulation, but enough to orient
+  // the palm. metacarpal1 is the index-finger base, so wrist->metacarpal1
+  // corresponds to wrist(15)->index(19).
+  //
+  // This also partially recovers forearm twist: the hand's direction is
+  // independent of the forearm's, so orienting it supplies the roll that a
+  // single forearm vector could never determine.
+  ["wrist.L", "metacarpal1.L", 15, 19],
+  ["wrist.R", "metacarpal1.R", 16, 20],
+];
+
+new GLTFLoader().load("../assets/bodytwin.glb", (gltf) => {
+  gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+  if (!skinned) { statusEl.textContent = "no SkinnedMesh in bodytwin.glb"; return; }
+
+  material = new THREE.MeshStandardMaterial({
+    color: 0x8fb8d8, roughness: 0.7, metalness: 0.05, transparent: true, opacity: 0.7,
+    // The mirroring negative x-scale inverts triangle winding; without
+    // DoubleSide the whole body would be backface-culled into invisibility.
+    side: THREE.DoubleSide,
+  });
+  skinned.material = material;
+
+  // Three.js derives the bounding volume from the REST pose and frustum-culls
+  // against it; once retargeting moves vertices outside it the mesh silently
+  // vanishes. This is the classic SkinnedMesh disappearing act.
+  skinned.frustumCulled = false;
+
+  twinModel = gltf.scene;
+  alignGroup.add(gltf.scene);
+  gltf.scene.updateMatrixWorld(true);
+
+  const restWorld = new Map();
+  for (const b of skinned.skeleton.bones) {
+    // Three.js's GLTFLoader runs node names through
+    // PropertyBinding.sanitizeNodeName, which strips characters reserved for
+    // animation paths — including '.'. So Anny's "upperarm01.L" arrives as
+    // "upperarm01L". Key the map on the normalised form so lookups work
+    // regardless of which spelling we ask for.
+    boneByName.set(norm(b.name), b);
+    restWorld.set(b, b.getWorldPosition(new THREE.Vector3()));
+  }
+
+  const boneOf = (name) => boneByName.get(norm(name));
+  const mid = (a, b) => restWorld.get(boneOf(a))
+    .clone().add(restWorld.get(boneOf(b))).multiplyScalar(0.5);
+  const shoulderMid = mid("upperarm01.L", "upperarm01.R");
+  const hipMid = mid("upperleg01.L", "upperleg01.R");
+
+  // Reference length for scaling: torso in the model's own metres. Torso is a
+  // better yardstick than full height because feet and head are often out of
+  // frame or poorly tracked.
+  twinTorsoMetres = shoulderMid.distanceTo(hipMid);
+
+  // Put hips at the group origin so alignGroup.position is literally "where
+  // the hips go".
+  gltf.scene.position.sub(hipMid);
+
+  // Seed a plausible scale BEFORE the first detection. In this pixel-perfect
+  // camera 1 unit == 1 pixel, so the default scale of 1 would render a 1.6 m
+  // model about 1.6 pixels tall — invisible, and indistinguishable from
+  // "tracking is broken". Assume a torso spanning ~a quarter of frame height.
+  const seed = (H * 0.25) / twinTorsoMetres;
+  alignGroup.scale.set(-seed, seed, seed);
+
+  for (const [boneName, endName, a, b] of DRIVEN) {
+    const bone = boneOf(boneName);
+    const end = boneOf(endName);
+    if (!bone || !end) { console.warn("missing bone", boneName, endName); continue; }
+    const dir = restWorld.get(end).clone().sub(restWorld.get(bone));
+    if (dir.lengthSq() < 1e-12) continue;
+    // Rest LENGTH is kept alongside the direction so we can stretch the bone
+    // to match the wearer's actual limb (see retarget). Without this, joints
+    // can never coincide when the wearer's proportions differ from the
+    // default body's — rotation alone cannot fix a length mismatch.
+    const restLen = dir.length();
+    restDirs.set(bone, dir.clone().normalize());
+    // endBone is kept so refreshRest() can recompute these after shape
+    // fitting moves the joints.
+    plan.push({ bone, a, b, restLen, endBone: end });
+  }
+
+  helper = new THREE.SkeletonHelper(skinned);
+  helper.visible = false;
+  scene.add(helper);
+
+  statusEl.innerHTML =
+    `driving ${plan.length}/${DRIVEN.length} bones · torso ${twinTorsoMetres.toFixed(2)} m<br>` +
+    `<span id="det">waiting for pose…</span>`;
+}, undefined, (e) => {
+  statusEl.textContent = "bodytwin.glb missing — run scripts/bodytwin/export_anny_gltf.py";
+  console.error(e);
+});
+
+// ---- Stage 5.4: shape fitting ----
+//
+// Solve for Anny's phenotype parameters so the twin's proportions match the
+// shopper's, instead of leaving it as a default body.
+//
+// Setup: bodyfit.json ships a Jacobian J where J[param][measurement] is how
+// many metres that measurement moves per +1 morph influence. Given the
+// shopper's measured vector d (relative to the base body), we want influences
+// w with J·w = d. That is over-determined (7 measurements, 5 params) and, more
+// importantly, ILL-CONDITIONED: muscle and weight shift these skeletal
+// distances by only 1-4 mm, because they change girth rather than bone
+// lengths. Solving naively would let landmark noise drive them to absurd
+// values.
+//
+// So: ridge-regularised least squares, (JᵀJ + λI)w = Jᵀd. The λ term pulls
+// poorly-observed parameters toward 0 (the neutral body) instead of letting
+// noise decide them. Honest consequence: girth is NOT recovered here. Doing
+// that properly needs the segmentation silhouette, which is why the plan
+// specifies "measurement vector + segmentation silhouette".
+let fitData = null;
+let fitApplied = false;
+const measureSamples = [];
+const FIT_FRAMES = 45;     // ~1.5 s of stable tracking
+
+// Ridge re-tuned for the NORMALISED system (fitting ratios changed every
+// Jacobian magnitude). Normalised JᵀJ diagonals are far better balanced —
+// gender 0.0036, height 0.043, proportions 0.014 — versus the absolute
+// version where gender/proportions were ~40x weaker than height.
+// Simulated against 0.7% relative measurement noise:
+//   0.001 -> gender -0.13/0.10 ; 0.0003 -> -0.05/0.14 ; 1e-5 -> -0.00/0.17
+// 0.0003 keeps bias small without letting spread grow.
+const RIDGE = 0.0003;
+
+// Only solve for parameters the measurements can actually see. Diagonal of
+// JᵀJ from the shipped Jacobian:
+//     height 0.089 | gender 0.0023 | proportions 0.0015
+//     muscle 0.00001 | weight 0.00002        <- ~5000x weaker
+// muscle and weight change GIRTH, and every measurement we have is a
+// bone-to-bone distance, so they are effectively invisible here. Including
+// them would just let noise pick a body build. They stay neutral until girth
+// is estimated from the segmentation silhouette (Stage 2.3's mask), which is
+// what the plan means by "measurement vector + segmentation silhouette".
+const SOLVE_PARAMS = ["gender", "height", "proportions"];
+
+fetch("../assets/bodyfit.json")
+  .then((r) => r.json())
+  .then((d) => { fitData = d; })
+  .catch((e) => console.warn("bodyfit.json not loaded — shape fitting disabled", e));
+
+const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
+const midOf = (p, q) => ({ x: (p.x + q.x) / 2, y: (p.y + q.y) / 2, z: (p.z + q.z) / 2 });
+
+// Same quantities the exporter measured between bone heads, but taken from
+// MediaPipe landmarks. They must correspond one-for-one or the Jacobian is
+// meaningless.
+// Which landmarks each measurement depends on, so we can drop measurements
+// whose inputs aren't actually visible. This matters more than it sounds:
+// thigh and shin carry the LARGEST Jacobian entries for `height` (218 mm and
+// 86 mm per unit), so if the legs are out of frame the solver is driven
+// hardest by the numbers it should trust least — which is exactly how height
+// ended up pinned at -0.96.
+const MEASURE_DEPS = {
+  shoulder_width: [11, 12],
+  hip_width: [23, 24],
+  upper_arm: [11, 13],
+  forearm: [13, 15],
+  thigh: [23, 25],
+  shin: [25, 27],
+  torso: [11, 12, 23, 24],
+};
+const VIS_MIN = 0.7;
+
+// A limb pointing toward or away from the camera is FORESHORTENED, and
+// MediaPipe's depth estimate is its least reliable output — so its measured
+// 3D length comes back too short. That is not a hypothetical: with hands on
+// hips, the arms measured 22% shorter than the model's, which dragged the
+// height fit to its clamp. Reject any segment whose direction is more than
+// this fraction along the camera axis.
+const MAX_Z_FRACTION = 0.5;
+
+function wellPosed(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+  const len = Math.hypot(dx, dy, dz);
+  return len > 1e-4 && Math.abs(dz) / len <= MAX_Z_FRACTION;
+}
+
+function measurePerson(w, raw) {
+  const vis = (i) => (raw?.[i]?.visibility ?? 1);
+  const ok = (name) => {
+    const deps = MEASURE_DEPS[name];
+    if (!deps.every((i) => vis(i) >= VIS_MIN)) return false;
+    // pairwise measurements also have to be side-on to the camera
+    if (deps.length === 2) return wellPosed(w[deps[0]], w[deps[1]]);
+    return true;
+  };
+  const val = {
+    shoulder_width: dist(w[11], w[12]),
+    hip_width: dist(w[23], w[24]),
+    upper_arm: dist(w[11], w[13]),
+    forearm: dist(w[13], w[15]),
+    thigh: dist(w[23], w[25]),
+    shin: dist(w[25], w[27]),
+    torso: dist(midOf(w[11], w[12]), midOf(w[23], w[24])),
+  };
+  // null marks "not measurable this frame" rather than silently passing a
+  // fabricated number into the solve.
+  const out = {};
+  for (const k of Object.keys(val)) out[k] = ok(k) ? val[k] : null;
+  return out;
+}
+
+// Small dense solver — Gaussian elimination with partial pivoting. n is 5.
+function solve(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    if (Math.abs(M[piv][c]) < 1e-12) return null;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  // Divide by the PIVOT M[i][i], not row[i][i] — row[i] is already a number,
+  // so indexing it again yields undefined and quietly poisons everything
+  // downstream with NaN.
+  return M.map((row, i) => row[n] / M[i][i]);
+}
+
+function fitShape() {
+  // Solve only the observable subset; anything else stays at neutral.
+  const params = SOLVE_PARAMS.filter((p) => fitData.params.includes(p));
+
+  // Fit on RATIOS, not absolute lengths.
+  //
+  // MediaPipe's landmarks and Anny's bone heads do not measure the same
+  // thing: landmark 11 sits near the acromion on the body SURFACE, while
+  // upperarm01.L is the shoulder JOINT CENTRE inside the body. Every
+  // measurement therefore carries a systematic anatomical offset, and
+  // MediaPipe's absolute metric scale is itself only approximate. Fitting
+  // absolute values makes the solver attribute all of that to body shape,
+  // which is why the parameters pinned to their clamps.
+  //
+  // Dividing through by torso length cancels both effects. It also matches
+  // what morphs should actually control: on-screen SIZE is already handled by
+  // alignGroup's px/m scale, so what remains for the morphs is PROPORTION.
+  const REF = "torso";
+
+  // Average only the frames where a measurement was actually observable, and
+  // keep a measurement only if it was visible in most of them.
+  const avgAbs = {};
+  const seen = {};
+  for (const m of fitData.measurements) {
+    const vals = measureSamples.map((x) => x[m]).filter((v) => v != null);
+    seen[m] = vals.length / measureSamples.length;
+    avgAbs[m] = vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
+  }
+
+  if (avgAbs[REF] == null || seen[REF] < 0.5) {
+    document.getElementById("fit").textContent = "torso not visible — can't fit";
+    return;
+  }
+
+  const meas = fitData.measurements.filter(
+    (m) => m !== REF && avgAbs[m] != null && seen[m] >= 0.5
+  );
+  const dropped = fitData.measurements.filter((m) => m !== REF && !meas.includes(m));
+  // console.log, not warn: warn prints a stack trace, and on a retrying hot
+  // path that buries every other message in the console.
+  if (dropped.length) {
+    console.log("shape fit: unusable measurements (occluded or foreshortened):",
+                dropped.join(", "));
+  }
+  // With few measurements the solve turns arbitrary; better to keep the
+  // neutral body and say so than to invent a shape from two numbers.
+  if (meas.length < 3) {
+    document.getElementById("fit").textContent =
+      `only ${meas.length} usable measurements — stand further back`;
+    return;
+  }
+
+  const avg = {};
+  for (const m of meas) avg[m] = avgAbs[m] / avgAbs[REF];
+
+  // Base and Jacobian re-expressed in the same normalised space. For a
+  // parameter, the perturbed ratio is (base_m + J_m) / (base_ref + J_ref) —
+  // the reference length moves too, which is exactly why this can't just be a
+  // scale factor applied afterwards.
+  const baseRef = fitData.base[REF];
+  const baseNorm = {};
+  for (const m of meas) baseNorm[m] = fitData.base[m] / baseRef;
+
+  const jNorm = {};
+  for (const p of params) {
+    const jRef = fitData.jacobian[p][REF];
+    jNorm[p] = {};
+    for (const m of meas) {
+      const perturbed = (fitData.base[m] + fitData.jacobian[p][m]) / (baseRef + jRef);
+      jNorm[p][m] = perturbed - baseNorm[m];
+    }
+  }
+
+  // Drop parameters the SURVIVING measurements can't see. Which params are
+  // observable depends on which measurements made it through the visibility
+  // gate — `height` gets most of its signal from thigh and shin, so with the
+  // legs out of frame it becomes nearly invisible, and solving for it anyway
+  // is how it ended up pinned at -1.00. Measure each param's signal as its
+  // JᵀJ diagonal over the available measurements, and keep only those within
+  // a factor of the strongest.
+  const diag = params.map((p) =>
+    meas.reduce((s, m) => s + jNorm[p][m] * jNorm[p][m], 0));
+  const strongest = Math.max(...diag);
+  const keep = params.filter((_, i) => diag[i] >= strongest * 0.02);
+  const cut = params.filter((p) => !keep.includes(p));
+  if (cut.length) {
+    console.warn("shape fit: dropping unobservable params with these " +
+                 "measurements:", cut.join(", "));
+  }
+  if (!keep.length) {
+    document.getElementById("fit").textContent = "no observable shape params";
+    return;
+  }
+  params.length = 0;
+  params.push(...keep);
+
+  const d = meas.map((m) => avg[m] - baseNorm[m]);
+  const J = meas.map((m) => params.map((p) => jNorm[p][m]));
+
+  // normal equations with ridge
+  const n = params.length;
+  const A = Array.from({ length: n }, (_, i) =>
+    Array.from({ length: n }, (_, j) =>
+      J.reduce((s, row) => s + row[i] * row[j], 0) + (i === j ? RIDGE : 0)));
+  const rhs = Array.from({ length: n }, (_, i) =>
+    J.reduce((s, row, k) => s + row[i] * d[k], 0));
+
+  const w = solve(A, rhs);
+  if (!w) { console.warn("shape fit singular — keeping neutral body"); return; }
+
+  // Never let a bad solve reach the model: NaN written into bone positions or
+  // morph influences corrupts the mesh permanently (it cannot be un-NaN'd
+  // without reloading the glb), and the failure looks like "the twin
+  // disappeared" rather than "the maths was wrong".
+  if (!w.every(Number.isFinite)) {
+    console.error("shape fit produced non-finite values, ignoring:", w);
+    document.getElementById("fit").textContent = "fit failed (non-finite)";
+    return;
+  }
+
+  // Clamp to the range the morphs were built for; extrapolating past +-1
+  // leaves the linear region we measured and distorts badly. Saturation is
+  // worth surfacing though — several params pinned at the clamp means the
+  // model genuinely cannot reach this body, not that this body is extreme.
+  const clamped = w.map((v) => THREE.MathUtils.clamp(v, -1, 1));
+  const pinned = clamped.filter((v) => Math.abs(v) >= 0.999).length;
+  if (pinned >= 2) {
+    console.log(`shape fit: ${pinned} params clamped — measurements are too ` +
+                `unreliable to determine shape; use the sliders instead.`);
+  }
+  applyShape(params, clamped, avg);
+}
+
+function applyShape(params, w, avg) {
+  const dict = skinned.morphTargetDictionary;
+  if (dict && skinned.morphTargetInfluences) {
+    params.forEach((p, i) => {
+      const idx = dict[p];
+      if (idx !== undefined) skinned.morphTargetInfluences[idx] = w[i];
+    });
+  }
+
+  // Move the JOINTS to match. Morph targets only move mesh vertices, so
+  // without this the skin would stretch while the skeleton kept the default
+  // body's proportions.
+  if (fitData.boneDeltas && fitData.boneNames) {
+    const bones = skinned.skeleton.bones;
+    const byName = new Map(bones.map((b) => [norm(b.name), b]));
+    // Bone translations are LOCAL, but the deltas are in model space, so a
+    // child's local offset changes by (its own delta - its parent's).
+    const idxOf = new Map(fitData.boneNames.map((n, i) => [norm(n), i]));
+    for (const bone of bones) {
+      const i = idxOf.get(norm(bone.name));
+      if (i === undefined) continue;
+      let dx = 0, dy = 0, dz = 0;
+      params.forEach((p, k) => {
+        const dlt = fitData.boneDeltas[p]?.[i];
+        if (dlt) { dx += dlt[0] * w[k]; dy += dlt[1] * w[k]; dz += dlt[2] * w[k]; }
+      });
+      const parentIdx = bone.parent?.isBone ? idxOf.get(norm(bone.parent.name)) : undefined;
+      if (parentIdx !== undefined) {
+        params.forEach((p, k) => {
+          const pd = fitData.boneDeltas[p]?.[parentIdx];
+          if (pd) { dx -= pd[0] * w[k]; dy -= pd[1] * w[k]; dz -= pd[2] * w[k]; }
+        });
+      }
+      bone.position.x += dx; bone.position.y += dy; bone.position.z += dz;
+    }
+    // Rest directions/lengths were captured from the OLD proportions; refresh
+    // them or the length retargeting will fight the new shape.
+    refreshRest();
+    // Moving the joints also moved the hips off the group origin, and
+    // alignGroup.position assumes "origin == hips". Without re-centring, the
+    // twin renders offset from the person — the further the shape fit moves
+    // the skeleton, the bigger the drift.
+    recentreHips();
+  }
+
+  fitApplied = true;
+  const summary = params.map((p, i) => `${p} ${w[i].toFixed(2)}`).join(" · ");
+  console.log("shape fit:", summary, "\nmeasured:", avg);
+  const fitEl = document.getElementById("fit");
+  if (fitEl) fitEl.textContent = summary;
+}
+
+// Put the hip midpoint back on the alignGroup origin, so alignGroup.position
+// keeps meaning "where the hips go".
+function recentreHips() {
+  const L = boneByName.get(norm("upperleg01.L"));
+  const R = boneByName.get(norm("upperleg01.R"));
+  const SL = boneByName.get(norm("upperarm01.L"));
+  const SR = boneByName.get(norm("upperarm01.R"));
+  if (!L || !R || !twinModel) return;
+  alignGroup.updateMatrixWorld(true);
+  const a = L.getWorldPosition(new THREE.Vector3());
+  const b = R.getWorldPosition(new THREE.Vector3());
+
+  // The alignment scale is torsoPixels / twinTorsoMetres, and shape fitting
+  // just CHANGED the model's torso length — so the stale divisor would render
+  // the twin at the wrong size. Recompute it here, in model units (undo
+  // alignGroup's scale, whose x is negative because of the mirror).
+  if (SL && SR) {
+    const s = Math.abs(alignGroup.scale.y) || 1;
+    const shoulderMid = SL.getWorldPosition(new THREE.Vector3())
+      .add(SR.getWorldPosition(new THREE.Vector3())).multiplyScalar(0.5);
+    const hipMidWorld = a.clone().add(b).multiplyScalar(0.5);
+    const t = shoulderMid.distanceTo(hipMidWorld) / s;
+    if (t > 1e-4) {
+      console.log(`torso after fit: ${twinTorsoMetres.toFixed(3)} -> ${t.toFixed(3)} m`);
+      twinTorsoMetres = t;
+    }
+  }
+
+  const hipMid = a.add(b).multiplyScalar(0.5);
+  // world -> alignGroup local, so the correction is applied in the same space
+  // twinModel.position lives in.
+  alignGroup.worldToLocal(hipMid);
+  twinModel.position.sub(hipMid);
+  alignGroup.updateMatrixWorld(true);
+}
+
+function refreshRest() {
+  skinned.skeleton.bones.forEach((b) => { b.quaternion.identity(); b.scale.setScalar(1); });
+  alignGroup.updateMatrixWorld(true);
+  const world = new Map();
+  for (const b of skinned.skeleton.bones) world.set(b, b.getWorldPosition(new THREE.Vector3()));
+  for (const item of plan) {
+    const endBone = item.endBone;
+    if (!endBone) continue;
+    const dir = world.get(endBone).clone().sub(world.get(item.bone));
+    if (dir.lengthSq() < 1e-12) continue;
+    item.restLen = dir.length();
+    restDirs.set(item.bone, dir.normalize());
+  }
+  lenRatio.clear();
+}
+
+// ---- smoothing (One-Euro, as built in Stage 2.2) ----
+// This was missing, and its absence is why the twin buzzed: raw landmark
+// noise went straight into bone rotations, and small positional jitter turns
+// into very visible angular jitter once you take the direction between two
+// nearby joints. Filter the INPUT landmarks, not the output rotations —
+// filtering quaternions is fiddlier and filtering angles breaks at the
+// +-180 deg wraparound.
+function smoothingFactor(dt, cutoff) {
+  const r = 2 * Math.PI * cutoff * dt;
+  return r / (r + 1);
+}
+class LowPassFilter {
+  filter(value, alpha) {
+    this.y = this.initialized ? alpha * value + (1 - alpha) * this.y : value;
+    this.initialized = true;
+    return this.y;
+  }
+}
+class OneEuroFilter {
+  constructor({ minCutoff = 1.0, beta = 0.3, dCutoff = 1.0 } = {}) {
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.xFilter = new LowPassFilter();
+    this.dxFilter = new LowPassFilter();
+    this.lastValue = null; this.lastTime = null;
+  }
+  filter(value, t) {
+    if (this.lastTime === null) {
+      this.lastTime = t; this.lastValue = value;
+      return this.xFilter.filter(value, 1);
+    }
+    const dt = Math.max((t - this.lastTime) / 1000, 1 / 240);
+    this.lastTime = t;
+    const dv = (value - this.lastValue) / dt;
+    this.lastValue = value;
+    const edv = this.dxFilter.filter(dv, smoothingFactor(dt, this.dCutoff));
+    const cutoff = this.minCutoff + this.beta * Math.abs(edv);
+    return this.xFilter.filter(value, smoothingFactor(dt, cutoff));
+  }
+}
+
+// Landmarks we actually consume: limb joints for pose, shoulders/hips for align.
+const USED = [11, 12, 13, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 28];
+const worldFilters = new Map();
+const imageFilters = new Map();
+for (const i of USED) {
+  worldFilters.set(i, [new OneEuroFilter(), new OneEuroFilter(), new OneEuroFilter()]);
+  // Image landmarks are normalised 0..1, a much smaller numeric range than
+  // metres, so beta has to be smaller or the filter barely engages.
+  imageFilters.set(i, [
+    new OneEuroFilter({ beta: 0.02 }),
+    new OneEuroFilter({ beta: 0.02 }),
+    new OneEuroFilter({ beta: 0.02 }),
+  ]);
+}
+
+function smoothLandmarks(lms, filters, t) {
+  const out = {};
+  for (const i of USED) {
+    const f = filters.get(i);
+    const lm = lms[i];
+    out[i] = { x: f[0].filter(lm.x, t), y: f[1].filter(lm.y, t), z: f[2].filter(lm.z ?? 0, t) };
+  }
+  return out;
+}
+
+// ---- pose retargeting (worldLandmarks) ----
+const _target = new THREE.Vector3();
+const _parentQ = new THREE.Quaternion();
+const _q = new THREE.Quaternion();
+const _a = new THREE.Vector3();
+const _b = new THREE.Vector3();
+
+// MediaPipe world landmarks are y-down and z-toward-camera; Three.js is y-up.
+//
+// Note what is NOT done here: x is not negated. Mirroring the pose data was
+// the cause of the twisted-wrist bug — a mirror image is a REFLECTION, and
+// setFromUnitVectors below can only produce a ROTATION. No rotation turns a
+// left arm into a right arm, so the limb would point roughly correctly while
+// its roll came out inverted. Instead we pose the twin in true anatomical
+// space and mirror the whole object at render time (see alignGroup's negative
+// x scale), which is what a real mirror does.
+function toScene(lm, out) {
+  return out.set(lm.x, -lm.y, -lm.z);
+}
+
+// Parent rotation in MODEL space, built by composing local bone quaternions
+// up the chain.
+//
+// Why not bone.parent.getWorldQuaternion()? Because the world matrix now runs
+// through alignGroup's negative x-scale (the mirror). A matrix with negative
+// determinant has no clean translation/rotation/positive-scale decomposition —
+// three.js resolves it by flipping a scale sign, and the quaternion it hands
+// back is not the rotation we need. Composing local quaternions keeps us in
+// model space, entirely clear of the mirror.
+// Product of every ancestor bone's scale, so a child can divide it out.
+function ancestorScale(bone) {
+  let s = 1;
+  for (let p = bone.parent; p && p.isBone; p = p.parent) s *= p.scale.x || 1;
+  return s;
+}
+
+function parentModelQuat(bone, out) {
+  out.identity();
+  const chain = [];
+  for (let p = bone.parent; p && p.isBone; p = p.parent) chain.push(p);
+  for (let i = chain.length - 1; i >= 0; i--) out.multiply(chain[i].quaternion);
+  return out;
+}
+
+// Per-bone length ratios, smoothed separately from pose: limb length is a
+// property of the person and shouldn't flicker frame to frame, so it gets
+// heavy smoothing while rotation stays responsive.
+const lenRatio = new Map();
+const LEN_SMOOTH = 0.02;
+
+// ---- torso orientation ----
+// Three landmarks give a full body frame: the shoulder line is one axis,
+// hips->shoulders is another, and their cross product is which way you face.
+// Rotating the skeleton root by that frame is what lets the twin turn with
+// you instead of permanently facing the camera.
+//
+// Rest frame of our converted model: +x = the body's LEFT, +y = up,
+// +z = front (verified against Anny's toe-vs-ankle offsets).
+const _left = new THREE.Vector3();
+const _up = new THREE.Vector3();
+const _front = new THREE.Vector3();
+const _shMid = new THREE.Vector3();
+const _hpMid = new THREE.Vector3();
+const _basis = new THREE.Matrix4();
+const _rootQ = new THREE.Quaternion();
+const _l1 = new THREE.Vector3();
+const _l2 = new THREE.Vector3();
+
+function orientTorso(worldLms, rootBone) {
+  toScene(worldLms[11], _l1);   // left shoulder
+  toScene(worldLms[12], _l2);   // right shoulder
+  _left.subVectors(_l1, _l2);
+  if (_left.lengthSq() < 1e-8) return;
+  _left.normalize();
+  _shMid.addVectors(_l1, _l2).multiplyScalar(0.5);
+
+  toScene(worldLms[23], _l1);   // left hip
+  toScene(worldLms[24], _l2);   // right hip
+  _hpMid.addVectors(_l1, _l2).multiplyScalar(0.5);
+
+  _up.subVectors(_shMid, _hpMid);
+  if (_up.lengthSq() < 1e-8) return;
+  _up.normalize();
+
+  // left x up = front in a right-handed frame; re-derive up afterwards so the
+  // basis is orthonormal even when the shoulder and spine axes aren't exactly
+  // perpendicular (they rarely are on a real body).
+  _front.crossVectors(_left, _up).normalize();
+  _up.crossVectors(_front, _left).normalize();
+
+  _basis.makeBasis(_left, _up, _front);
+  _rootQ.setFromRotationMatrix(_basis);
+  rootBone.quaternion.slerp(_rootQ, 0.5); // slerp, never lerp, for rotations
+}
+
+const RETARGET_VIS_MIN = 0.5;
+
+function retarget(worldLms, raw) {
+  // Root first: limb targets are converted through parentModelQuat, which
+  // walks up through the root, so the torso orientation must be final before
+  // any limb is solved.
+  const root = skinned?.skeleton?.bones?.[0];
+  if (root) orientTorso(worldLms, root);
+
+  const vis = (i) => (raw?.[i]?.visibility ?? 1);
+
+  for (const { bone, a, b, restLen } of plan) {
+    // Skip bones whose landmarks the model isn't confident about, and hold
+    // the last good pose instead. Hand points especially drop out — driving
+    // a bone from a guessed landmark produces a wild rotation that reads as
+    // the limb spasming, which is worse than it simply not moving.
+    if (vis(a) < RETARGET_VIS_MIN || vis(b) < RETARGET_VIS_MIN) continue;
+    toScene(worldLms[a], _a);
+    toScene(worldLms[b], _b);
+    _target.subVectors(_b, _a);
+    const measured = _target.length();
+    if (measured < 1e-4) continue;
+    _target.divideScalar(measured); // normalise, reusing the length we already have
+
+    // --- rotation ---
+    // DRIVEN is ordered parent-before-child, so by the time we reach a child
+    // its parent's local quaternion is already final for this frame.
+    parentModelQuat(bone, _parentQ);
+    _target.applyQuaternion(_parentQ.invert());
+    _q.setFromUnitVectors(restDirs.get(bone), _target);
+    bone.quaternion.copy(_q);
+
+    // --- length ---
+    // Stretch the bone so its segment matches the wearer's. Clamped because a
+    // badly-tracked frame (an occluded wrist, say) would otherwise produce a
+    // grotesque limb; better to under-correct than to deform absurdly.
+    const raw = THREE.MathUtils.clamp(measured / restLen, 0.6, 1.6);
+    const prev = lenRatio.get(bone);
+    const s = prev === undefined ? raw : prev + (raw - prev) * LEN_SMOOTH;
+    lenRatio.set(bone, s);
+
+    // Scaling a bone scales its children's offsets, which is what lengthens
+    // the limb. It also scales the mesh around the bone — so the limb gets
+    // slightly thicker as well as longer. That is a real approximation, not
+    // an accident: proper girth comes from shape fitting in 5.4, not from
+    // bone scale. Children inherit this scale, so divide it out to stop
+    // ratios compounding. It must be the ACCUMULATED ancestor scale, not the
+    // immediate parent's: above lowerarm01 sits the undriven twist bone
+    // upperarm02 (scale 1), while the scale we applied lives further up on
+    // upperarm01 and propagates down through it.
+    bone.scale.setScalar(s / ancestorScale(bone));
+  }
+}
+
+// ---- auto-alignment (image landmarks) ----
+// Smoothed so the twin doesn't buzz: landmark noise is small in absolute terms
+// but very visible once multiplied into scale.
+// Light now that One-Euro filters the inputs — stacking heavy smoothing on
+// already-smoothed data just adds lag without removing more jitter.
+const SMOOTH = 0.6;
+let smoothScale = 0, smoothX = 0, smoothY = 0, haveAlign = false;
+
+function pix(lm, out) {
+  // Mirrored to match the CSS-flipped video, then into pixel-world coords
+  // where 1 unit == 1 pixel at z=0.
+  return out.set((0.5 - lm.x) * W, -(lm.y - 0.5) * H, 0);
+}
+
+const _p1 = new THREE.Vector3();
+const _p2 = new THREE.Vector3();
+const _sh = new THREE.Vector3();
+const _hp = new THREE.Vector3();
+
+function align(lms) {
+  if (!twinTorsoMetres) return;
+
+  _sh.copy(pix(lms[11], _p1)).add(pix(lms[12], _p2)).multiplyScalar(0.5);
+  _hp.copy(pix(lms[23], _p1)).add(pix(lms[24], _p2)).multiplyScalar(0.5);
+
+  const torsoPx = _sh.distanceTo(_hp);
+  if (torsoPx < 1) return;
+
+  // metres -> pixels for THIS person at THIS distance from the camera
+  const scale = torsoPx / twinTorsoMetres;
+
+  // Roll is NOT applied here any more: orientTorso() derives a full 3D body
+  // frame from the landmarks, and that already contains lean. Applying a
+  // screen-space roll on top would double-count it.
+
+  if (!haveAlign) {
+    smoothScale = scale; smoothX = _hp.x; smoothY = _hp.y;
+    haveAlign = true;
+  } else {
+    smoothScale += (scale - smoothScale) * SMOOTH;
+    smoothX += (_hp.x - smoothX) * SMOOTH;
+    smoothY += (_hp.y - smoothY) * SMOOTH;
+  }
+
+  alignGroup.position.set(smoothX, smoothY, 0);
+  // Negative x: mirror the whole twin so it reads like a mirror against the
+  // CSS-flipped video, while the bones underneath stay anatomically correct.
+  alignGroup.scale.set(-smoothScale, smoothScale, smoothScale);
+}
+
+// ---- raw landmark overlay ----
+// Independent of the twin entirely: if dots appear, MediaPipe sees you and any
+// remaining problem is in the twin's maths. If no dots, it's detection/framing.
+// Separating those two failure modes is the whole point.
+const dotsCtx = document.getElementById("dots").getContext("2d");
+
+// Joints we can compare directly: MediaPipe index -> the twin bone that
+// should sit at the same place on screen.
+const CHECK = [
+  [13, "lowerarm01.L"], [15, "wrist.L"],
+  [14, "lowerarm01.R"], [16, "wrist.R"],
+  [25, "lowerleg01.L"], [27, "foot.L"],
+  [26, "lowerleg01.R"], [28, "foot.R"],
+];
+
+const _v = new THREE.Vector3();
+
+function drawDots(lms) {
+  dotsCtx.clearRect(0, 0, W, H);
+  if (!lms) return;
+
+  // red: what MediaPipe sees
+  dotsCtx.fillStyle = "#ff3355";
+  for (const lm of lms) {
+    dotsCtx.beginPath();
+    dotsCtx.arc((1 - lm.x) * W, lm.y * H, 3, 0, Math.PI * 2);
+    dotsCtx.fill();
+  }
+
+  // green: where the twin's matching joints actually ended up. Objective
+  // check on the retargeting — green should land on red. Any consistent
+  // offset (mirrored, rotated, scaled) names the bug directly.
+  if (!skinned) return;
+  dotsCtx.fillStyle = "#33ff88";
+  dotsCtx.strokeStyle = "rgba(255,255,255,0.35)";
+  for (const [mpIdx, boneName] of CHECK) {
+    const bone = boneByName.get(norm(boneName));
+    if (!bone) continue;
+    bone.getWorldPosition(_v).project(camera);
+    const gx = (_v.x * 0.5 + 0.5) * W;
+    const gy = (-_v.y * 0.5 + 0.5) * H;
+    dotsCtx.beginPath();
+    dotsCtx.arc(gx, gy, 4, 0, Math.PI * 2);
+    dotsCtx.fill();
+
+    const rx = (1 - lms[mpIdx].x) * W;
+    const ry = lms[mpIdx].y * H;
+    dotsCtx.beginPath();
+    dotsCtx.moveTo(gx, gy);
+    dotsCtx.lineTo(rx, ry);
+    dotsCtx.stroke();
+  }
+}
+
+// ---- ui ----
+document.getElementById("vopacity").addEventListener("input", (e) => {
+  video.style.opacity = String(Number(e.target.value) / 100);
+});
+document.getElementById("topacity").addEventListener("input", (e) => {
+  if (material) material.opacity = Number(e.target.value) / 100;
+});
+document.getElementById("refit").addEventListener("click", () => {
+  // Re-fitting from the CURRENT body would stack a second correction on top of
+  // the first, so reset morphs and joints to neutral before collecting again.
+  if (!skinned) return;
+  if (skinned.morphTargetInfluences) skinned.morphTargetInfluences.fill(0);
+  measureSamples.length = 0;
+  fitApplied = false;
+  document.getElementById("fit").textContent = "fitting…";
+  console.warn("re-fit: morphs reset, but joint offsets are not undone — " +
+               "reload for a fully clean fit.");
+});
+
+addEventListener("keydown", (e) => {
+  if (e.key === "s" && helper) helper.visible = !helper.visible;
+  if (e.key === "m" && material) material.wireframe = !material.wireframe;
+});
+
+// ---- loop ----
+let lastTime = -1;
+function loop() {
+  requestAnimationFrame(loop);
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastTime) {
+    lastTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const detected = Boolean(res.worldLandmarks?.length && res.landmarks?.length);
+
+    if (detected && plan.length) {
+      const t = performance.now();
+      const sw = smoothLandmarks(res.worldLandmarks[0], worldFilters, t);
+
+      // Collect measurements over ~1.5 s before fitting. A single frame is far
+      // too noisy to solve against, and this is the same reasoning as the
+      // rolling average in Stage 2.4.
+      if (fitData && !fitApplied && skinned) {
+        // pass the RAW landmarks too: visibility lives there, not on the
+        // smoothed copies
+        measureSamples.push(measurePerson(sw, res.worldLandmarks[0]));
+        if (measureSamples.length >= FIT_FRAMES) {
+          fitShape();
+          // Always clear the buffer. If the fit succeeded we're done; if it
+          // bailed (not enough visible measurements) we must start a fresh
+          // window rather than re-solving the same stale samples on every
+          // subsequent frame — that's what produced 244 repeated attempts.
+          measureSamples.length = 0;
+        }
+      }
+
+      retarget(sw, res.worldLandmarks[0]);
+      align(smoothLandmarks(res.landmarks[0], imageFilters, t));
+      // Refresh before drawDots reads bone world positions, otherwise the
+      // green markers trail the actual pose by a frame.
+      alignGroup.updateMatrixWorld(true);
+    }
+    drawDots(res.landmarks?.[0]);
+
+    const det = document.getElementById("det");
+    if (det) {
+      det.textContent = detected
+        ? `tracking · scale ${smoothScale.toFixed(0)} px/m`
+        : "no pose detected";
+      det.style.color = detected ? "#8c8" : "#fa0";
+    }
+  }
+  renderer.render(scene, camera);
+}
+
+(async () => {
+  // Report which STEP failed and the error's .name — DOMExceptions from
+  // getUserMedia often have an empty .message but a precise .name
+  // (NotReadableError = camera held by another app/tab, NotAllowedError =
+  // permission denied, NotFoundError = no camera).
+  let step = "camera";
+  try {
+    await startCamera();
+    step = "model";
+    await loadLandmarker();
+    loop();
+  } catch (err) {
+    const name = err?.name || "Error";
+    const msg = err?.message || "(no message)";
+    statusEl.innerHTML =
+      `<span style="color:#f77">${step} failed: ${name}</span><br>${msg}` +
+      (name === "NotReadableError"
+        ? "<br>→ another tab or app holds the camera. Close other MirrorFit tabs."
+        : "");
+    console.error(step, err);
+  }
+})();
+</script>
+</body>
+</html>
