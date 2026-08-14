@@ -37,6 +37,22 @@ Update this line as stages complete.
 - When I paste a bug, guide me to the cause with questions before showing the fix.
 - Weekly: when I ask for a "week review", walk my code and refactor WITH me,
   explaining every change.
+- Start each planned session in plan mode; show me the plan before building.
+- One session per numbered block in the roadmap. Never batch two — each has its
+  own acceptance evidence, and mixing them is how you get "it ran" instead of
+  "it works".
+
+## Verification (non-negotiable — see docs/TESTING.md)
+- Before saying something works, state whether you observed it in MY
+  configuration or only that code executed without throwing. If you have not
+  seen real numbers from my actual setup, say so plainly.
+- For every test you add, prove it fails when the bug is present: reintroduce
+  the bug, show the failure, restore, show the pass. Note it in the commit.
+- Test fixtures must reproduce the live transform chain (scaled, mirrored
+  parent), and assert against measured ground truth — not against whatever the
+  code currently outputs.
+- A fallback that changes results must throw or set a visible degraded flag.
+  console.warn is not a failure mode.
 
 ## Conventions
 - Prototype: vanilla JS ES modules, no framework, no build step
@@ -56,6 +72,6 @@ Update this line as stages complete.
 - scripts/bodytwin/    — Anny -> glTF exporter (regenerates web/assets/bodytwin.glb)
 - backend/             — FastAPI app (Stage 4+)
 - infra/               — CDK app (Stage 4+)
-- docs/                — plan + spec + accuracy notes
+- docs/                — plan, spec, testing doctrine, decisions
 
 The live try-on is web/stage6/tryon-live.html — camera, twin and cloth together.
