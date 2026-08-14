@@ -62,6 +62,19 @@ MEASUREMENTS = {
     "torso":          ("upperarm01.L", "upperarm01.R", "upperleg01.L", "upperleg01.R"),
 }
 
+# Silhouette widths, sampled as fractions of the shoulder->hip span.
+#
+# These matter because every measurement above is a distance between two
+# joints, and joints tell you nothing about GIRTH — which is exactly what
+# `muscle` and `weight` control, and why those params were unobservable.
+# Silhouette width also avoids depth entirely: it is measured across the
+# image plane, where both segmentation and MediaPipe are strong, unlike z.
+SILHOUETTE_LEVELS = {"chest": 0.30, "waist": 0.62, "hips": 0.95}
+
+# Only torso vertices count. In the rest pose the arms hang beside the body,
+# so a naive x-extent at chest height would measure "torso + both arms".
+TORSO_BONE_PREFIXES = ("spine", "pelvis", "breast")
+
 
 def zup_to_yup(v: np.ndarray) -> np.ndarray:
     """Rotate -90 deg about X: Anny (x, y, z_up) -> glTF (x, z_up, -y)."""
@@ -86,8 +99,24 @@ def prune_to_four(indices: np.ndarray, weights: np.ndarray):
     return j.astype(np.uint16), w.astype(np.float32), dropped
 
 
-def measure(heads: np.ndarray, name_to_idx: dict[str, int]) -> dict[str, float]:
-    """Measurements from bone-head positions, in metres."""
+def torso_vertex_mask(indices: np.ndarray, weights: np.ndarray,
+                      bone_names: list[str]) -> np.ndarray:
+    """Vertices whose dominant bone is part of the torso.
+
+    Needed because the rest pose has the arms hanging beside the body, so a
+    plain x-extent at chest height would measure torso PLUS both arms.
+    """
+    dominant = indices[np.arange(indices.shape[0]), np.argmax(weights, axis=1)]
+    is_torso = np.array(
+        [n.lower().startswith(TORSO_BONE_PREFIXES) for n in bone_names]
+    )
+    return is_torso[dominant]
+
+
+def measure(heads: np.ndarray, name_to_idx: dict[str, int],
+            verts: np.ndarray | None = None,
+            torso_mask: np.ndarray | None = None) -> dict[str, float]:
+    """Measurements in metres, in Anny's own space (z is up, x is across)."""
     out = {}
     for name, spec in MEASUREMENTS.items():
         if len(spec) == 2:
@@ -96,6 +125,31 @@ def measure(heads: np.ndarray, name_to_idx: dict[str, int]) -> dict[str, float]:
         else:
             a, b, c, d = (heads[name_to_idx[s]] for s in spec)
             out[name] = float(np.linalg.norm((a + b) / 2 - (c + d) / 2))
+
+    if verts is None or torso_mask is None:
+        return out
+
+    # Silhouette widths: horizontal extent of the torso at fixed fractions of
+    # the shoulder->hip span. Anny is z-up, so height is z and width is x.
+    shoulder_z = float(
+        (heads[name_to_idx["upperarm01.L"]][2] + heads[name_to_idx["upperarm01.R"]][2]) / 2)
+    hip_z = float(
+        (heads[name_to_idx["upperleg01.L"]][2] + heads[name_to_idx["upperleg01.R"]][2]) / 2)
+    span = hip_z - shoulder_z
+
+    tv = verts[torso_mask]
+    slab = abs(span) * 0.06  # thin enough to be a "level", thick enough to catch vertices
+
+    for label, t in SILHOUETTE_LEVELS.items():
+        z = shoulder_z + t * span
+        band = tv[np.abs(tv[:, 2] - z) < slab]
+        # Fall back to the nearest ring of vertices rather than emitting a
+        # bogus zero if the slab happens to land in a gap.
+        if band.shape[0] < 8:
+            order = np.argsort(np.abs(tv[:, 2] - z))[:64]
+            band = tv[order]
+        out[f"width_{label}"] = float(band[:, 0].max() - band[:, 0].min())
+
     return out
 
 
@@ -217,16 +271,18 @@ def main() -> None:
         with torch.no_grad():
             return model(phenotype_kwargs=p)
 
-    base = run()
-    base_verts = base["vertices"][0].cpu().numpy()
-    base_heads = base["rest_bone_heads"][0].cpu().numpy()
-    base_meas = measure(base_heads, name_to_idx)
-
     faces = model.faces.cpu().numpy()
     idx = model.vertex_bone_indices.cpu().numpy()
     wts = model.vertex_bone_weights.cpu().numpy()
     parents = list(model.bone_parents)
     names = list(model.bone_labels)
+    torso_mask = torso_vertex_mask(idx, wts, names)
+
+    base = run()
+    base_verts = base["vertices"][0].cpu().numpy()
+    base_heads = base["rest_bone_heads"][0].cpu().numpy()
+    base_meas = measure(base_heads, name_to_idx, base_verts, torso_mask)
+    print(f"torso vertices: {int(torso_mask.sum())} / {torso_mask.size}")
 
     print(f"mesh: {base_verts.shape[0]} verts, {faces.shape[0]} faces, {len(parents)} bones")
     print(f"base measurements (m): "
@@ -237,9 +293,10 @@ def main() -> None:
     morph_deltas, morph_names, jacobian, bone_deltas = [], [], {}, {}
     for param in SHAPE_PARAMS:
         out = run(**{param: 1.0})
-        delta = out["vertices"][0].cpu().numpy() - base_verts
+        pverts = out["vertices"][0].cpu().numpy()
+        delta = pverts - base_verts
         heads = out["rest_bone_heads"][0].cpu().numpy()
-        meas = measure(heads, name_to_idx)
+        meas = measure(heads, name_to_idx, pverts, torso_mask)
 
         morph_deltas.append(zup_to_yup(delta))
         morph_names.append(param)
@@ -268,7 +325,8 @@ def main() -> None:
     fit_path = Path(args.fit_out)
     fit_path.write_text(json.dumps({
         "params": SHAPE_PARAMS,
-        "measurements": list(MEASUREMENTS.keys()),
+        "measurements": list(base_meas.keys()),
+        "silhouetteLevels": SILHOUETTE_LEVELS,
         "base": base_meas,
         # jacobian[param][measurement] = metres of change per +1 influence
         "jacobian": jacobian,

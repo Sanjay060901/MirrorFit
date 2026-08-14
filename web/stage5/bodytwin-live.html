@@ -121,6 +121,11 @@ async function loadLandmarker() {
     },
     runningMode: "VIDEO",
     numPoses: 1,
+    // Needed for shape fitting: silhouette widths are the only measurements
+    // that observe GIRTH, and unlike everything derived from worldLandmarks
+    // they live in the image plane rather than depending on MediaPipe's weak
+    // depth estimate.
+    outputSegmentationMasks: true,
     // Looser than default: we'd rather track a partially-visible body with
     // some uncertainty than show nothing at all. The One-Euro-style smoothing
     // downstream absorbs the extra noise.
@@ -302,6 +307,10 @@ const FIT_FRAMES = 45;     // ~1.5 s of stable tracking
 // Simulated against 0.7% relative measurement noise:
 //   0.001 -> gender -0.13/0.10 ; 0.0003 -> -0.05/0.14 ; 1e-5 -> -0.00/0.17
 // 0.0003 keeps bias small without letting spread grow.
+// Re-tuned again with silhouette widths in the system. Diagonals are now
+// gender 0.0077, weight 0.0053, height 0.082, proportions 0.024 — all within
+// ~15x of each other, versus ~5000x before. Bias/spread at 0.0003 is
+// gender -0.07/0.14, weight -0.06/0.10, height -0.01/0.03.
 const RIDGE = 0.0003;
 
 // Only solve for parameters the measurements can actually see. Diagonal of
@@ -313,7 +322,11 @@ const RIDGE = 0.0003;
 // them would just let noise pick a body build. They stay neutral until girth
 // is estimated from the segmentation silhouette (Stage 2.3's mask), which is
 // what the plan means by "measurement vector + segmentation silhouette".
-const SOLVE_PARAMS = ["gender", "height", "proportions"];
+// `weight` is in now: silhouette widths made it observable (JᵀJ diagonal went
+// from 0.00002 to 0.00528, a ~260x improvement, 97% of it from the silhouette
+// terms). `muscle` stays out — it moves torso widths by only 1-2 mm because in
+// Anny it mostly affects limb definition, not girth.
+const SOLVE_PARAMS = ["gender", "weight", "height", "proportions"];
 
 fetch("../assets/bodyfit.json")
   .then((r) => r.json())
@@ -355,6 +368,56 @@ function wellPosed(a, b) {
   const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
   const len = Math.hypot(dx, dy, dz);
   return len > 1e-4 && Math.abs(dz) / len <= MAX_Z_FRACTION;
+}
+
+// Torso widths from the segmentation mask, at the same shoulder->hip
+// fractions the exporter measured on the mesh.
+//
+// The arms problem: at chest or hip height, arms hanging beside the body sit
+// on the same scanline as the torso, so a plain min/max across the row would
+// measure "torso + both arms". Instead we walk OUTWARD from the torso
+// centreline and stop at the first background pixel — that returns the
+// contiguous body run and naturally excludes any arm separated by a gap. No
+// pose requirement, no arm-position heuristic.
+//
+// Returned in pseudo-metres (ratio to torso, times the metric torso length)
+// so these sit in the same units as every other measurement and flow through
+// the existing normalisation unchanged.
+function measureSilhouette(mask, imageLms, torsoMetres) {
+  if (!mask || !fitData?.silhouetteLevels) return {};
+  const w = mask.width, h = mask.height;
+  const probs = mask.getAsFloat32Array();
+  if (!probs || probs.length < w * h) return {};
+
+  const sx = ((imageLms[11].x + imageLms[12].x) / 2) * w;
+  const sy = ((imageLms[11].y + imageLms[12].y) / 2) * h;
+  const hx = ((imageLms[23].x + imageLms[24].x) / 2) * w;
+  const hy = ((imageLms[23].y + imageLms[24].y) / 2) * h;
+  const torsoPx = Math.hypot(hx - sx, hy - sy);
+  if (torsoPx < 8) return {};
+
+  const out = {};
+  for (const [label, t] of Object.entries(fitData.silhouetteLevels)) {
+    const px = sx + t * (hx - sx);
+    const py = sy + t * (hy - sy);
+    const row = Math.round(py);
+    const cx = Math.round(px);
+    if (row < 0 || row >= h || cx < 1 || cx >= w - 1) continue;
+
+    // Centre must actually be on the body, or the scan is meaningless.
+    if (probs[row * w + cx] < 0.5) continue;
+
+    let L = cx, R = cx;
+    while (L > 0 && probs[row * w + L - 1] >= 0.5) L--;
+    while (R < w - 1 && probs[row * w + R + 1] >= 0.5) R++;
+
+    // Touching a frame edge means the body is cut off and the width is a
+    // lower bound, not a measurement.
+    if (L === 0 || R === w - 1) continue;
+
+    out[`width_${label}`] = ((R - L) / torsoPx) * torsoMetres;
+  }
+  return out;
 }
 
 function measurePerson(w, raw) {
@@ -1001,7 +1064,12 @@ function loop() {
       if (fitData && !fitApplied && skinned) {
         // pass the RAW landmarks too: visibility lives there, not on the
         // smoothed copies
-        measureSamples.push(measurePerson(sw, res.worldLandmarks[0]));
+        const sample = measurePerson(sw, res.worldLandmarks[0]);
+        const mask = res.segmentationMasks?.[0];
+        if (mask && sample.torso) {
+          Object.assign(sample, measureSilhouette(mask, res.landmarks[0], sample.torso));
+        }
+        measureSamples.push(sample);
         if (measureSamples.length >= FIT_FRAMES) {
           fitShape();
           // Always clear the buffer. If the fit succeeded we're done; if it
@@ -1019,6 +1087,11 @@ function loop() {
       alignGroup.updateMatrixWorld(true);
     }
     drawDots(res.landmarks?.[0]);
+
+    // MPMask owns GPU/WASM-side memory the JS garbage collector can't
+    // reclaim. Segmentation now runs every frame, so failing to close it
+    // leaks steadily until the tab dies. Must happen after all reads above.
+    res.segmentationMasks?.forEach((m) => m.close());
 
     const det = document.getElementById("det");
     if (det) {
