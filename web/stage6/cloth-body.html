@@ -22,6 +22,7 @@
   <div id="err"></div>
   <hr style="border-color:#333" />
   <label>cloth res <input id="res" type="range" min="24" max="96" value="56" step="8" /> <span id="rv">56</span></label>
+  <label>ease (size) <input id="ea" type="range" min="-40" max="80" value="25" /> <span id="eav">+25 mm</span></label>
   <label>bend compliance <input id="cb" type="range" min="0" max="100" value="42" /> <span id="cbv">42</span></label>
   <label>iterations <input id="it" type="range" min="1" max="20" value="8" /> <span id="itv">8</span></label>
   <label>friction <input id="fr" type="range" min="0" max="100" value="85" /> <span id="frv">85</span></label>
@@ -70,24 +71,85 @@ let compBend = 0.42, iterations = 8, friction = 0.55;
 // ---------- capsules from the twin's skeleton ----------
 // Radii are eyeballed proportions of the segment length; real garment work
 // would derive them from the mesh's actual girth at each bone.
+// [boneA, boneB, ownerBones, elliptical]
+//
+// Radii are no longer guessed — they're measured from the mesh at load (see
+// measureRadii). `ownerBones` says which skinned vertices belong to this body
+// part, so measuring the chest doesn't accidentally include the arms hanging
+// beside it. `elliptical` marks parts whose cross-section is not round: a
+// torso is markedly wider side-to-side than front-to-back, and forcing it to
+// a circle is a large part of why the cloth stood off the body.
 const CAPSULE_SPEC = [
-  ["spine03", "spine01", 0.115],      // chest
-  ["spine05", "spine03", 0.105],      // belly
-  ["upperleg01.L", "upperleg01.R", 0.10], // pelvis, spanning the hips
-  ["upperarm01.L", "lowerarm01.L", 0.048],
-  ["lowerarm01.L", "wrist.L", 0.040],
-  ["upperarm01.R", "lowerarm01.R", 0.048],
-  ["lowerarm01.R", "wrist.R", 0.040],
-  ["upperleg01.L", "lowerleg01.L", 0.080],
-  ["lowerleg01.L", "foot.L", 0.060],
-  ["upperleg01.R", "lowerleg01.R", 0.080],
-  ["lowerleg01.R", "foot.R", 0.060],
-  ["neck01", "head", 0.055],
+  ["spine01", "neck01", ["spine01", "breast"], true],           // upper chest
+  ["spine03", "spine01", ["spine02", "spine03", "breast"], true], // chest
+  ["spine05", "spine03", ["spine04", "spine05"], true],         // waist
+  // Hips are marked round, not elliptical: this capsule runs HORIZONTALLY,
+  // so its axis is the x direction and the rx/rz convention (which assumes a
+  // vertical capsule) doesn't apply. Measured as rx it came out 0.000, which
+  // also made the shader divide by zero and disable hip collision entirely.
+  ["upperleg01.L", "upperleg01.R", ["pelvis"], false],
+  ["clavicle.L", "upperarm01.L", ["clavicle", "shoulder"], false],
+  ["clavicle.R", "upperarm01.R", ["clavicle", "shoulder"], false],
+  ["upperarm01.L", "lowerarm01.L", ["upperarm01.L", "upperarm02.L"], false],
+  ["lowerarm01.L", "wrist.L", ["lowerarm01.L", "lowerarm02.L"], false],
+  ["upperarm01.R", "lowerarm01.R", ["upperarm01.R", "upperarm02.R"], false],
+  ["lowerarm01.R", "wrist.R", ["lowerarm01.R", "lowerarm02.R"], false],
+  ["upperleg01.L", "lowerleg01.L", ["upperleg01.L", "upperleg02.L"], false],
+  ["lowerleg01.L", "foot.L", ["lowerleg01.L", "lowerleg02.L"], false],
+  ["upperleg01.R", "lowerleg01.R", ["upperleg01.R", "upperleg02.R"], false],
+  ["lowerleg01.R", "foot.R", ["lowerleg01.R", "lowerleg02.R"], false],
+  // owners are "neck" only: including "head" measured the skull as neck
+  // girth and produced an 11 cm radius
+  ["neck01", "head", ["neck"], false],
 ];
+
+// High percentile, not a middling one. For a rounded cross-section most
+// vertices sit at intermediate angles, so |d.x| and |d.z| are usually well
+// below their semi-axes — an 80th percentile understated both (and unevenly,
+// which is how the chest came out deeper than it was wide). 0.95 tracks the
+// actual extent while still rejecting stray outliers.
+const RADIUS_PERCENTILE = 0.95;
+
+// Nothing should ever collide with a zero-radius capsule.
+const MIN_RADIUS = 0.02;
+
+// Capsules are an approximation, and the real mesh bulges outside them in
+// places — deltoids, the chest surface, the shoulder cap. Cloth held exactly
+// at the capsule surface therefore gets pierced by the body wherever that
+// happens, which is what the grey patches showing through the shirt were.
+// Inflating the collision radius keeps the fabric clear of the actual skin.
+// Real cloth solvers do the same thing, and it doubles as a safety buffer
+// against tunnelling at speed.
+const COLLISION_MARGIN = 0.018;
 
 const norm = (s) => s.replace(/[\[\]\.:\/]/g, "");
 let capsules = [];      // {a: Vector3, b: Vector3, r: number}
 let bodyBox = null;
+
+// Which body part each vertex belongs to, from its dominant skin weight.
+// Without this, measuring the chest's radius would sweep in the arms resting
+// beside it and report a torso twice as wide as it is.
+function dominantBoneNames(skinned) {
+  const si = skinned.geometry.attributes.skinIndex;
+  const sw = skinned.geometry.attributes.skinWeight;
+  const bones = skinned.skeleton.bones;
+  const out = new Array(si.count);
+  for (let v = 0; v < si.count; v++) {
+    let best = 0, bestW = -1;
+    for (let j = 0; j < 4; j++) {
+      const w = sw.getComponent(v, j);
+      if (w > bestW) { bestW = w; best = si.getComponent(v, j); }
+    }
+    out[v] = norm(bones[best]?.name ?? "");
+  }
+  return out;
+}
+
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  arr.sort((x, y) => x - y);
+  return arr[Math.min(arr.length - 1, Math.floor(arr.length * p))];
+}
 
 function buildCapsules(skinned) {
   const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
@@ -95,36 +157,210 @@ function buildCapsules(skinned) {
     const b = byName.get(norm(n));
     return b ? b.getWorldPosition(new THREE.Vector3()) : null;
   };
+
+  const owners = dominantBoneNames(skinned);
+  const posAttr = skinned.geometry.attributes.position;
+  const world = skinned.matrixWorld;
+  const v = new THREE.Vector3();
+  const ab = new THREE.Vector3();
+  const ap = new THREE.Vector3();
+
   const out = [];
-  for (const [n1, n2, r] of CAPSULE_SPEC) {
+  for (const [n1, n2, ownerPrefixes, elliptical] of CAPSULE_SPEC) {
     const a = wp(n1), b = wp(n2);
     if (!a || !b) { console.warn("capsule bones missing:", n1, n2); continue; }
-    out.push({ a, b, r });
+
+    ab.subVectors(b, a);
+    const denom = Math.max(ab.dot(ab), 1e-9);
+    const prefixes = ownerPrefixes.map(norm);
+
+    // Distances from the axis. front/back are kept SIGNED and separate,
+    // because the spine runs along the BACK of the torso rather than through
+    // its centre — so a spine-based capsule sees a big forward extent and
+    // almost nothing behind it. Measuring |d.z| would report nearly the full
+    // torso depth as a radius. Instead we find both extents, place the axis
+    // between them, and take the half-distance.
+    const radial = [], sideways = [], front = [], back = [];
+    for (let i = 0; i < posAttr.count; i++) {
+      const owner = owners[i];
+      if (!prefixes.some((p) => owner.startsWith(p))) continue;
+
+      v.fromBufferAttribute(posAttr, i).applyMatrix4(world);
+      ap.subVectors(v, a);
+      const t = THREE.MathUtils.clamp(ap.dot(ab) / denom, 0, 1);
+      // Skip the ends: near a joint the neighbouring part bulges in and
+      // would overstate this segment's girth.
+      if (t < 0.15 || t > 0.85) continue;
+
+      const closest = ab.clone().multiplyScalar(t).add(a);
+      const d = v.clone().sub(closest);
+      radial.push(d.length());
+
+      // Measure each semi-axis only from the vertices that actually lie near
+      // it. Taking a percentile of |d.x| over ALL vertices mixes in the
+      // front and back of the torso, where |d.x| is near zero — which
+      // understates the width and is why the chest came out deeper than wide.
+      const ax = Math.abs(d.x), az = Math.abs(d.z);
+      if (ax > az * 2.0) sideways.push(ax);    // clearly on a side
+      if (az > ax * 2.0) {                     // clearly on front or back
+        if (d.z > 0) front.push(d.z); else back.push(-d.z);
+      }
+    }
+
+    if (radial.length < 8) {
+      console.warn(`capsule ${n1}->${n2}: only ${radial.length} owned vertices, ` +
+                   `falling back to a fraction of segment length`);
+      const r = Math.max(ab.length() * 0.35, MIN_RADIUS);
+      out.push({ a, b, rx: r, rz: r });
+      continue;
+    }
+
+    const clamp = (r) => Math.max(r, MIN_RADIUS);
+    if (elliptical) {
+      // Fall back to the radial estimate if a band was too sparse to trust.
+      const rad = percentile(radial, RADIUS_PERCENTILE);
+      const rx = clamp(sideways.length >= 8
+        ? percentile(sideways, RADIUS_PERCENTILE) : rad);
+
+      let rz = rad, dz = 0;
+      if (front.length >= 8 && back.length >= 8) {
+        const f = percentile(front, RADIUS_PERCENTILE);
+        const bk = percentile(back, RADIUS_PERCENTILE);
+        rz = (f + bk) / 2;          // half-depth, not full depth
+        dz = (f - bk) / 2;          // how far the axis must move forward
+      }
+
+      // Shift the capsule forward so it sits in the middle of the torso.
+      const shift = new THREE.Vector3(0, 0, dz);
+      out.push({
+        a: a.clone().add(shift),
+        b: b.clone().add(shift),
+        rx, rz: clamp(rz),
+      });
+    } else {
+      const r = clamp(percentile(radial, RADIUS_PERCENTILE));
+      out.push({ a, b, rx: r, rz: r });
+    }
   }
+
+  console.log("capsules:\n" + out.map((c, i) =>
+    `  ${CAPSULE_SPEC[i][0]}->${CAPSULE_SPEC[i][1]} ` +
+    `rx=${c.rx.toFixed(3)} rz=${c.rz.toFixed(3)} zShift=${(c.a.z - (wp(CAPSULE_SPEC[i][0])?.z ?? c.a.z)).toFixed(3)}`
+  ).join("\n"));
   return out;
 }
 
 // ---------- cloth ----------
-function buildSim() {
-  // A square sheet dropped horizontally above the shoulders. Draping a flat
-  // sheet is the classic collision test: any tunnelling or sinking is
-  // immediately visible, unlike a pre-fitted garment which can hide errors.
-  const size = bodyBox.getSize(new THREE.Vector3());
-  const centre = bodyBox.getCenter(new THREE.Vector3());
-  const span = Math.max(size.x, size.z) * 1.9;
-  const spacing = span / (RES - 1);
-  const y = bodyBox.max.y * 0.92;
+// Ease: how much bigger than the body the garment is cut, in metres. This is
+// the single number that decides whether a size reads as tight or loose, and
+// it is exactly what real pattern grading varies between sizes. Negative ease
+// (garment smaller than the body) is what makes fabric strain.
+//
+// CAVEAT worth knowing: COLLISION_MARGIN puts a floor under effective ease.
+// The cloth can never sit closer than the inflated collision surface, so ease
+// below -COLLISION_MARGIN is simply absorbed and shows no extra strain. To
+// demonstrate genuine tightness the margin has to come down, which trades
+// against the body poking through. Real solvers resolve this with mesh or
+// SDF collision instead of capsules.
+let EASE = 0.025;
 
-  const N = RES * RES;
+function garmentProfile() {
+  // Cut the garment from the BODY's own measurements — the same idea a
+  // pattern drafter uses. The chest capsule already told us the torso's
+  // elliptical radii, so the shirt is drafted to fit rather than guessed.
+  const named = {};
+  CAPSULE_SPEC.forEach(([n1, n2], i) => { named[`${n1}->${n2}`] = capsules[i]; });
+
+  const chest = named["spine03->spine01"] ?? capsules[1];
+  const waist = named["spine05->spine03"] ?? capsules[2];
+  const hips = named["upperleg01.L->upperleg01.R"] ?? capsules[3];
+  const neck = named["neck01->head"] ?? capsules[capsules.length - 1];
+  const shoulderL = named["clavicle.L->upperarm01.L"];
+  const shoulderR = named["clavicle.R->upperarm01.R"];
+
+  const yShoulder = Math.max(chest.a.y, chest.b.y);
+  const yHem = hips.a.y - 0.10;              // finishes below the hip
+  const yNeck = neck.a.y + 0.01;
+
+  // Half the distance between the two shoulder joints: how far the yoke has
+  // to reach sideways before it turns and runs down the body.
+  const halfShoulder = shoulderL && shoulderR
+    ? Math.abs(shoulderL.b.x - shoulderR.b.x) / 2
+    : chest.rx * 1.35;
+
+  return {
+    cx: (chest.a.x + chest.b.x) / 2,
+    cz: (chest.a.z + chest.b.z) / 2,
+    yShoulder, yHem, yNeck,
+    // The neck opening must clear the neck's COLLISION radius, not its
+    // measured radius. Cutting it to the raw measurement made the hole
+    // smaller than the thing it has to fit over, so collision ejected the
+    // whole garment sideways every frame. Anything the garment must pass
+    // over has to be sized against the inflated collision geometry.
+    neckR: neck.rx + COLLISION_MARGIN + 0.022,
+    halfShoulder,
+    chestRx: chest.rx, chestRz: chest.rz,
+    waistRx: waist.rx, waistRz: waist.rz,
+    hipRx: hips.rx, hipRz: hips.rz,
+  };
+}
+
+function buildSim() {
+  // A shaped t-shirt, not a flat sheet.
+  //
+  // A sheet cannot fit a body: it has no neck hole to catch on the shoulders,
+  // no seams to wrap, and no shaping to follow the waist. It tents over the
+  // top and hangs outside the body — which is exactly what a real bedsheet
+  // does too. A garment stays on because it is MECHANICALLY CAPTURED (the
+  // neck hole rests on the shoulders) and fits because its dimensions are
+  // drafted from the body plus an ease allowance.
+  //
+  // Topology is a closed tube: columns wrap around the body, rows run from
+  // the neck down to the hem. The first rows form a near-horizontal yoke
+  // spreading from the neck opening out to the shoulders; the rest fall
+  // vertically, interpolating chest -> waist -> hip radii.
+  const p = garmentProfile();
+  const NCOL = RES;                        // around the body
+  const NROW = Math.round(RES * 0.85);     // neck to hem
+  // A broader yoke seats the shirt across both shoulders instead of balancing
+  // it on a narrow cone. Without sleeves there is nothing capturing the
+  // garment sideways — a real shirt is held by the arms through the sleeves —
+  // so the shoulder area is doing all the work of keeping it on.
+  const YOKE = Math.max(4, Math.round(NROW * 0.22));
+
+  const N = NCOL * NROW;
   const pos = new Float32Array(N * 4);
-  const idx = (c, r) => r * RES + c;
-  for (let r = 0; r < RES; r++) {
-    for (let c = 0; c < RES; c++) {
+  const idx = (c, r) => r * NCOL + ((c % NCOL) + NCOL) % NCOL;   // columns wrap
+
+  for (let r = 0; r < NROW; r++) {
+    let rx, rz, y;
+    if (r < YOKE) {
+      // Yoke: opens out from the neck hole to the shoulder line, dropping
+      // only slightly. This is the part that catches on the shoulders.
+      const t = r / YOKE;
+      rx = THREE.MathUtils.lerp(p.neckR, p.halfShoulder, t);
+      rz = THREE.MathUtils.lerp(p.neckR, p.chestRz + EASE, t);
+      y = THREE.MathUtils.lerp(p.yNeck, p.yShoulder, t);
+    } else {
+      // Body: chest -> waist -> hip, so the shirt follows the torso instead
+      // of hanging as a cylinder.
+      const t = (r - YOKE) / (NROW - 1 - YOKE);
+      const [ax, az] = t < 0.5
+        ? [THREE.MathUtils.lerp(p.chestRx, p.waistRx, t * 2),
+           THREE.MathUtils.lerp(p.chestRz, p.waistRz, t * 2)]
+        : [THREE.MathUtils.lerp(p.waistRx, p.hipRx, (t - 0.5) * 2),
+           THREE.MathUtils.lerp(p.waistRz, p.hipRz, (t - 0.5) * 2)];
+      rx = ax + EASE; rz = az + EASE;
+      y = THREE.MathUtils.lerp(p.yShoulder, p.yHem, t);
+    }
+
+    for (let c = 0; c < NCOL; c++) {
+      const th = (c / NCOL) * Math.PI * 2;
       const i = idx(c, r);
-      pos[i * 4] = centre.x - span / 2 + c * spacing;
+      pos[i * 4] = p.cx + rx * Math.cos(th);
       pos[i * 4 + 1] = y;
-      pos[i * 4 + 2] = centre.z - span / 2 + r * spacing;
-      pos[i * 4 + 3] = 1;      // nothing pinned: it should fall and drape
+      pos[i * 4 + 2] = p.cz + rz * Math.sin(th);
+      pos[i * 4 + 3] = 1;    // nothing pinned; the neck hole holds it up
     }
   }
 
@@ -136,19 +372,19 @@ function buildSim() {
       pos[a * 4 + 1] - pos[b * 4 + 1],
       pos[a * 4 + 2] - pos[b * 4 + 2]));
   };
-  for (let r = 0; r < RES; r++) {
-    for (let c = 0; c < RES; c++) {
-      if (c + 1 < RES) add(idx(c, r), idx(c + 1, r), 0);
-      if (r + 1 < RES) add(idx(c, r), idx(c, r + 1), 0);
-      if (c + 1 < RES && r + 1 < RES) {
+  for (let r = 0; r < NROW; r++) {
+    for (let c = 0; c < NCOL; c++) {
+      // Around the body — wraps, so there is no seam to split open.
+      add(idx(c, r), idx(c + 1, r), 0);
+      if (r + 1 < NROW) {
+        add(idx(c, r), idx(c, r + 1), 0);
         add(idx(c, r), idx(c + 1, r + 1), 0);
         add(idx(c + 1, r), idx(c, r + 1), 0);
       }
-      if (c + 2 < RES) add(idx(c, r), idx(c + 2, r), 1);
-      if (r + 2 < RES) add(idx(c, r), idx(c, r + 2), 1);
+      add(idx(c, r), idx(c + 2, r), 1);
+      if (r + 2 < NROW) add(idx(c, r), idx(c, r + 2), 1);
     }
   }
-
   const groups = [];
   for (const wantKind of [0, 1]) {
     const map = [];
@@ -172,7 +408,7 @@ function buildSim() {
       ranges,
     });
   }
-  return { N, pos, groups, idx };
+  return { N, pos, groups, idx, NCOL, NROW };
 }
 
 function greedyColour(cA, cB, numParticles) {
@@ -270,7 +506,8 @@ fn collide(@builtin(global_invocation_id) gid : vec3<u32>) {
     let cap = caps[c];
     let a = cap.a.xyz;
     let b = cap.b.xyz;
-    let r = cap.a.w;
+    let rx = cap.a.w;      // half-width side to side
+    let rz = cap.b.w;      // half-depth front to back
     let ab = b - a;
     let denom = max(dot(ab, ab), 1e-9);
     // clamp keeps the closest point on the SEGMENT, which is what turns an
@@ -278,12 +515,27 @@ fn collide(@builtin(global_invocation_id) gid : vec3<u32>) {
     let t = clamp(dot(p3 - a, ab) / denom, 0.0, 1.0);
     let closest = a + ab * t;
     var d = p3 - closest;
-    let dist = length(d);
-    if (dist < r) {
+
+    // Elliptical cross-section via the scaled-space trick: divide by the
+    // radii so the ellipse becomes a unit circle, test there, then scale the
+    // push-out back. A torso is much wider than it is deep, and treating it
+    // as round is what left the cloth standing off the chest.
+    let e = vec3<f32>(d.x / rx, d.y / rx, d.z / rz);
+    let el = length(e);
+    if (el < 1.0) {
       // Degenerate case: a particle exactly on the axis has no push-out
       // direction, so pick an arbitrary one rather than dividing by zero.
-      var n = select(d / max(dist, 1e-9), vec3<f32>(0.0, 1.0, 0.0), dist < 1e-6);
-      p3 = closest + n * r;
+      var u = select(e / max(el, 1e-9), vec3<f32>(0.0, 0.0, 1.0), el < 1e-6);
+      p3 = closest + vec3<f32>(u.x * rx, u.y * rx, u.z * rz);
+
+      // Surface NORMAL, which on an ellipse is not the radial direction.
+      // For (X/rx)^2 + (Y/rx)^2 + (Z/rz)^2 = 1 the gradient is
+      // (X/rx^2, Y/rx^2, Z/rz^2), so with X = u.x*rx it reduces to
+      // (u.x/rx, u.y/rx, u.z/rz). Using the radial offset instead would
+      // misclassify part of the sliding motion as normal motion and let the
+      // cloth creep.
+      let n = normalize(vec3<f32>(u.x / rx, u.y / rx, u.z / rz)
+                        + vec3<f32>(1e-9, 0.0, 0.0));
 
       // POSITION-based friction, applied at the moment of contact.
       // Damping velocity afterwards (as updateVel does) is too weak: by then
@@ -316,7 +568,10 @@ fn updateVel(@builtin(global_invocation_id) gid : vec3<u32>) {
     let t = clamp(dot(pos[i].xyz - cap.a.xyz, ab) / max(dot(ab, ab), 1e-9), 0.0, 1.0);
     let closest = cap.a.xyz + ab * t;
     let d = pos[i].xyz - closest;
-    if (length(d) < cap.a.w * 1.05) {
+    // same scaled-space test as collide, so contact detection agrees with
+    // where the collision actually pushed particles to
+    let e = vec3<f32>(d.x / cap.a.w, d.y / cap.a.w, d.z / cap.b.w);
+    if (length(e) < 1.05) {
       let n = normalize(d + vec3<f32>(1e-9, 1e-9, 1e-9));
       let vn = dot(v, n) * n;
       let vt = v - vn;
@@ -379,10 +634,13 @@ function createResources() {
   const lamBuf = mk(totalC * 4, S | GPUBufferUsage.COPY_DST);
 
   // capsules: two vec4 each, radius packed into a.w
+  // a.w = rx (side to side), b.w = rz (front to back), both inflated by the
+  // collision margin. The garment is still CUT to the measured radii — only
+  // the collision surface is enlarged, so ease still means what it should.
   const capData = new Float32Array(capsules.length * 8);
   capsules.forEach((c, i) => {
-    capData.set([c.a.x, c.a.y, c.a.z, c.r], i * 8);
-    capData.set([c.b.x, c.b.y, c.b.z, 0], i * 8 + 4);
+    capData.set([c.a.x, c.a.y, c.a.z, c.rx + COLLISION_MARGIN], i * 8);
+    capData.set([c.b.x, c.b.y, c.b.z, c.rz + COLLISION_MARGIN], i * 8 + 4);
   });
   const capBuf = mk(Math.max(capData.byteLength, 32), S | GPUBufferUsage.COPY_DST);
   device.queue.writeBuffer(capBuf, 0, capData);
@@ -538,10 +796,13 @@ function buildCapsuleDebug() {
   for (const c of capsules) {
     const dir = c.b.clone().sub(c.a);
     const len = dir.length();
-    const g = new THREE.CapsuleGeometry(c.r, Math.max(len, 1e-4), 4, 8);
+    // Built round at rx, then squashed along its own local axis to show the
+    // elliptical section — so the debug view matches what the solver tests.
+    const g = new THREE.CapsuleGeometry(c.rx, Math.max(len, 1e-4), 4, 10);
     const m = new THREE.Mesh(g, mat);
     m.position.copy(c.a).add(c.b).multiplyScalar(0.5);
     m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+    m.scale.z = c.rz / c.rx;
     capsuleGroup.add(m);
   }
   scene.add(capsuleGroup);
@@ -552,9 +813,12 @@ function buildRenderMesh() {
   geometry = new THREE.BufferGeometry();
   renderPos = new Float32Array(sim.N * 3);
   geometry.setAttribute("position", new THREE.BufferAttribute(renderPos, 3));
+  // Columns wrap, so the last column joins back to the first — otherwise the
+  // shirt would render with a slit down one side even though the simulation
+  // is closed there.
   const tri = [];
-  for (let r = 0; r < RES - 1; r++) {
-    for (let c = 0; c < RES - 1; c++) {
+  for (let r = 0; r < sim.NROW - 1; r++) {
+    for (let c = 0; c < sim.NCOL; c++) {
       const a = sim.idx(c, r), b = sim.idx(c + 1, r);
       const d = sim.idx(c, r + 1), e = sim.idx(c + 1, r + 1);
       tri.push(a, d, b, b, d, e);
@@ -576,9 +840,21 @@ function syncUI() {
   $("itv").textContent = iterations;
   $("frv").textContent = $("fr").value;
   $("rv").textContent = RES;
+  $("eav").textContent = `${$("ea").value > 0 ? "+" : ""}${$("ea").value} mm`;
 }
 ["cb", "it", "fr"].forEach((id) => $(id).addEventListener("input", syncUI));
 $("res").addEventListener("change", (e) => { RES = Number(e.target.value); createResources(); syncUI(); });
+$("ea").addEventListener("change", (e) => {
+  // Ease changes the CUT of the garment, so the mesh has to be rebuilt — it
+  // isn't a runtime parameter like compliance. This is the same distinction
+  // as in real production: pattern dimensions are baked per size.
+  EASE = Number(e.target.value) / 1000;
+  createResources();
+  syncUI();
+});
+$("ea").addEventListener("input", () => {
+  $("eav").textContent = `${$("ea").value > 0 ? "+" : ""}${$("ea").value} mm`;
+});
 addEventListener("keydown", (e) => {
   if (e.key === "b" && bodyGroup) bodyGroup.visible = !bodyGroup.visible;
   if (e.key === "c" && capsuleGroup) capsuleGroup.visible = !capsuleGroup.visible;
