@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 6.4 — cloth colliding with the body twin</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.72);
+        padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.8; }
+  #ui label { display: block; }
+  input[type=range] { width: 160px; vertical-align: middle; }
+  .k { color: #7ab; font-weight: 600; }
+  #stats { color: #8c8; }
+  #err { color: #f77; max-width: 440px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Stage 6.4 — cloth on a body</b></div>
+  <div id="stats">initialising…</div>
+  <div id="err"></div>
+  <hr style="border-color:#333" />
+  <label>cloth res <input id="res" type="range" min="24" max="96" value="56" step="8" /> <span id="rv">56</span></label>
+  <label>bend compliance <input id="cb" type="range" min="0" max="100" value="42" /> <span id="cbv">42</span></label>
+  <label>iterations <input id="it" type="range" min="1" max="20" value="8" /> <span id="itv">8</span></label>
+  <label>friction <input id="fr" type="range" min="0" max="100" value="55" /> <span id="frv">55</span></label>
+  <div><span class="k">b</span> body · <span class="k">c</span> capsules · <span class="k">w</span> wireframe · <span class="k">space</span> drop again</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+// ---- Stage 6.4: collision ----
+//
+// WHY CAPSULES, NOT THE MESH
+// The body twin has 13,718 vertices and 27,420 triangles. Testing every cloth
+// particle against every triangle, for every solver iteration, for every
+// substep, is billions of tests per frame — hopeless in real time.
+//
+// A capsule (line segment + radius) is the standard approximation. Point-vs-
+// capsule is: project the point onto the segment, clamp to its ends, measure
+// the distance, push out if closer than the radius. A handful of arithmetic
+// ops, no branching to speak of, and the shape genuinely fits limbs and
+// torsos well because bodies ARE roughly a collection of tapered cylinders.
+//
+// Collision runs as a projection INSIDE the solver loop, not as a
+// post-process. If you push particles out after the constraints are solved,
+// the next frame's constraints pull them straight back in and the cloth
+// visibly sinks into the body. Treating "stay outside the body" as just
+// another constraint to satisfy is what makes it hold.
+
+const stats = document.getElementById("stats");
+const errEl = document.getElementById("err");
+
+let device = null, gpu = null, sim = null;
+let RES = 56;
+const SUBSTEPS = 8, WORKGROUP = 64;
+let compBend = 0.42, iterations = 8, friction = 0.55;
+
+// ---------- capsules from the twin's skeleton ----------
+// Radii are eyeballed proportions of the segment length; real garment work
+// would derive them from the mesh's actual girth at each bone.
+const CAPSULE_SPEC = [
+  ["spine03", "spine01", 0.115],      // chest
+  ["spine05", "spine03", 0.105],      // belly
+  ["upperleg01.L", "upperleg01.R", 0.10], // pelvis, spanning the hips
+  ["upperarm01.L", "lowerarm01.L", 0.048],
+  ["lowerarm01.L", "wrist.L", 0.040],
+  ["upperarm01.R", "lowerarm01.R", 0.048],
+  ["lowerarm01.R", "wrist.R", 0.040],
+  ["upperleg01.L", "lowerleg01.L", 0.080],
+  ["lowerleg01.L", "foot.L", 0.060],
+  ["upperleg01.R", "lowerleg01.R", 0.080],
+  ["lowerleg01.R", "foot.R", 0.060],
+  ["neck01", "head", 0.055],
+];
+
+const norm = (s) => s.replace(/[\[\]\.:\/]/g, "");
+let capsules = [];      // {a: Vector3, b: Vector3, r: number}
+let bodyBox = null;
+
+function buildCapsules(skinned) {
+  const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
+  const wp = (n) => {
+    const b = byName.get(norm(n));
+    return b ? b.getWorldPosition(new THREE.Vector3()) : null;
+  };
+  const out = [];
+  for (const [n1, n2, r] of CAPSULE_SPEC) {
+    const a = wp(n1), b = wp(n2);
+    if (!a || !b) { console.warn("capsule bones missing:", n1, n2); continue; }
+    out.push({ a, b, r });
+  }
+  return out;
+}
+
+// ---------- cloth ----------
+function buildSim() {
+  // A square sheet dropped horizontally above the shoulders. Draping a flat
+  // sheet is the classic collision test: any tunnelling or sinking is
+  // immediately visible, unlike a pre-fitted garment which can hide errors.
+  const size = bodyBox.getSize(new THREE.Vector3());
+  const centre = bodyBox.getCenter(new THREE.Vector3());
+  const span = Math.max(size.x, size.z) * 1.9;
+  const spacing = span / (RES - 1);
+  const y = bodyBox.max.y * 0.92;
+
+  const N = RES * RES;
+  const pos = new Float32Array(N * 4);
+  const idx = (c, r) => r * RES + c;
+  for (let r = 0; r < RES; r++) {
+    for (let c = 0; c < RES; c++) {
+      const i = idx(c, r);
+      pos[i * 4] = centre.x - span / 2 + c * spacing;
+      pos[i * 4 + 1] = y;
+      pos[i * 4 + 2] = centre.z - span / 2 + r * spacing;
+      pos[i * 4 + 3] = 1;      // nothing pinned: it should fall and drape
+    }
+  }
+
+  const A = [], B = [], rest = [], kind = [];
+  const add = (a, b, k) => {
+    A.push(a); B.push(b); kind.push(k);
+    rest.push(Math.hypot(
+      pos[a * 4] - pos[b * 4],
+      pos[a * 4 + 1] - pos[b * 4 + 1],
+      pos[a * 4 + 2] - pos[b * 4 + 2]));
+  };
+  for (let r = 0; r < RES; r++) {
+    for (let c = 0; c < RES; c++) {
+      if (c + 1 < RES) add(idx(c, r), idx(c + 1, r), 0);
+      if (r + 1 < RES) add(idx(c, r), idx(c, r + 1), 0);
+      if (c + 1 < RES && r + 1 < RES) {
+        add(idx(c, r), idx(c + 1, r + 1), 0);
+        add(idx(c + 1, r), idx(c, r + 1), 0);
+      }
+      if (c + 2 < RES) add(idx(c, r), idx(c + 2, r), 1);
+      if (r + 2 < RES) add(idx(c, r), idx(c, r + 2), 1);
+    }
+  }
+
+  const groups = [];
+  for (const wantKind of [0, 1]) {
+    const map = [];
+    for (let k = 0; k < A.length; k++) if (kind[k] === wantKind) map.push(k);
+    const sa = map.map((k) => A[k]);
+    const sb = map.map((k) => B[k]);
+    const { colour, numColours } = greedyColour(sa, sb, N);
+    const order = map.map((_, i) => i).sort((x, y) => colour[x] - colour[y]);
+    const ranges = [];
+    let start = 0;
+    for (let c = 0; c < numColours; c++) {
+      const count = order.filter((i) => colour[i] === c).length;
+      ranges.push({ start, count });
+      start += count;
+    }
+    groups.push({
+      kind: wantKind,
+      a: new Uint32Array(order.map((i) => sa[i])),
+      b: new Uint32Array(order.map((i) => sb[i])),
+      rest: new Float32Array(order.map((i) => rest[map[i]])),
+      ranges,
+    });
+  }
+  return { N, pos, groups, idx };
+}
+
+function greedyColour(cA, cB, numParticles) {
+  const n = cA.length;
+  const head = new Int32Array(numParticles).fill(-1);
+  const next = new Int32Array(n * 2).fill(-1);
+  const owner = new Int32Array(n * 2);
+  let e = 0;
+  for (let k = 0; k < n; k++) {
+    for (const p of [cA[k], cB[k]]) { owner[e] = k; next[e] = head[p]; head[p] = e; e++; }
+  }
+  const colour = new Int32Array(n).fill(-1);
+  const used = new Uint8Array(64);
+  let maxColour = 0;
+  for (let k = 0; k < n; k++) {
+    used.fill(0);
+    for (const p of [cA[k], cB[k]]) {
+      for (let it = head[p]; it !== -1; it = next[it]) {
+        const o = owner[it];
+        if (o !== k && colour[o] >= 0) used[colour[o]] = 1;
+      }
+    }
+    let c = 0;
+    while (c < used.length && used[c]) c++;
+    colour[k] = c;
+    if (c > maxColour) maxColour = c;
+  }
+  return { colour, numColours: maxColour + 1 };
+}
+
+// ---------- shaders ----------
+const SHADER = `
+struct Params { dt : f32, compliance : f32, colourOffset : u32, colourCount : u32, };
+struct Globals { dt : f32, gravity : f32, friction : f32, pad : f32, numParticles : u32, numCapsules : u32, };
+struct Capsule { a : vec4<f32>, b : vec4<f32>, };   // a.w = radius
+
+@group(0) @binding(0) var<storage, read_write> pos : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> prevPos : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> vel : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> cA : array<u32>;
+@group(0) @binding(4) var<storage, read> cB : array<u32>;
+@group(0) @binding(5) var<storage, read> cRest : array<f32>;
+@group(0) @binding(6) var<storage, read_write> lambda : array<f32>;
+@group(0) @binding(7) var<uniform> g : Globals;
+@group(0) @binding(8) var<storage, read> caps : array<Capsule>;
+@group(1) @binding(0) var<uniform> p : Params;
+
+@compute @workgroup_size(64)
+fn predict(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= g.numParticles) { return; }
+  let w = pos[i].w;
+  if (w == 0.0) { return; }
+  var v = vel[i].xyz;
+  v.y = v.y + g.gravity * g.dt;
+  v = v * 0.998;
+  prevPos[i] = pos[i];
+  pos[i] = vec4<f32>(pos[i].xyz + v * g.dt, w);
+  vel[i] = vec4<f32>(v, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn solve(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= p.colourCount) { return; }
+  let k = gid.x + p.colourOffset;
+  let a = cA[k]; let b = cB[k];
+  let pa = pos[a]; let pb = pos[b];
+  let wa = pa.w; let wb = pb.w;
+  let wsum = wa + wb;
+  if (wsum == 0.0) { return; }
+  var d = pa.xyz - pb.xyz;
+  let len = length(d);
+  if (len < 1e-9) { return; }
+  let C = len - cRest[k];
+  let alpha = p.compliance / (p.dt * p.dt);
+  let dl = (-C - alpha * lambda[k]) / (wsum + alpha);
+  lambda[k] = lambda[k] + dl;
+  let corr = d * (dl / len);
+  if (wa > 0.0) { pos[a] = vec4<f32>(pa.xyz + corr * wa, wa); }
+  if (wb > 0.0) { pos[b] = vec4<f32>(pb.xyz - corr * wb, wb); }
+}
+
+// Collision as a projection, run every iteration alongside the distance
+// constraints. One thread per PARTICLE (not per capsule), so each particle is
+// written by exactly one thread and no colouring is needed here.
+@compute @workgroup_size(64)
+fn collide(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= g.numParticles) { return; }
+  let w = pos[i].w;
+  if (w == 0.0) { return; }
+  var p3 = pos[i].xyz;
+
+  for (var c : u32 = 0u; c < g.numCapsules; c = c + 1u) {
+    let cap = caps[c];
+    let a = cap.a.xyz;
+    let b = cap.b.xyz;
+    let r = cap.a.w;
+    let ab = b - a;
+    let denom = max(dot(ab, ab), 1e-9);
+    // clamp keeps the closest point on the SEGMENT, which is what turns an
+    // infinite cylinder into a capsule with rounded ends
+    let t = clamp(dot(p3 - a, ab) / denom, 0.0, 1.0);
+    let closest = a + ab * t;
+    var d = p3 - closest;
+    let dist = length(d);
+    if (dist < r) {
+      // Degenerate case: a particle exactly on the axis has no push-out
+      // direction, so pick an arbitrary one rather than dividing by zero.
+      var n = select(d / max(dist, 1e-9), vec3<f32>(0.0, 1.0, 0.0), dist < 1e-6);
+      p3 = closest + n * r;
+    }
+  }
+  pos[i] = vec4<f32>(p3, w);
+}
+
+@compute @workgroup_size(64)
+fn updateVel(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= g.numParticles) { return; }
+  if (pos[i].w == 0.0) { return; }
+  var v = (pos[i].xyz - prevPos[i].xyz) / g.dt;
+
+  // Friction where the cloth is resting on the body: damp the component of
+  // velocity ALONG the surface. Without it the sheet slides off like silk on
+  // glass, which reads as wrong even when the collision itself is correct.
+  for (var c : u32 = 0u; c < g.numCapsules; c = c + 1u) {
+    let cap = caps[c];
+    let ab = cap.b.xyz - cap.a.xyz;
+    let t = clamp(dot(pos[i].xyz - cap.a.xyz, ab) / max(dot(ab, ab), 1e-9), 0.0, 1.0);
+    let closest = cap.a.xyz + ab * t;
+    let d = pos[i].xyz - closest;
+    if (length(d) < cap.a.w * 1.05) {
+      let n = normalize(d + vec3<f32>(1e-9, 1e-9, 1e-9));
+      let vn = dot(v, n) * n;
+      let vt = v - vn;
+      v = vn + vt * (1.0 - g.friction);
+    }
+  }
+  vel[i] = vec4<f32>(v, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn clearLambda(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= arrayLength(&lambda)) { return; }
+  lambda[gid.x] = 0.0;
+}
+`;
+
+const UNIFORM_STRIDE = 256;
+
+async function initGPU() {
+  if (!navigator.gpu) throw new Error("WebGPU unavailable — see webgpu-probe.html");
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error("no GPU adapter");
+  device = await adapter.requestDevice();
+  device.lost.then((i) => { errEl.textContent = `GPU device lost: ${i.message || i.reason}`; });
+}
+
+function createResources() {
+  if (gpu) {
+    for (const b of [gpu.posBuf, gpu.prevBuf, gpu.velBuf, gpu.lamBuf, gpu.globalsBuf,
+                     gpu.paramsBuf, gpu.readBuf, gpu.capBuf, gpu.aBuf, gpu.bBuf, gpu.rBuf]) {
+      try { b.destroy(); } catch { /* already gone */ }
+    }
+  }
+  sim = buildSim();
+  const { N, pos, groups } = sim;
+  const S = GPUBufferUsage.STORAGE;
+  const mk = (bytes, usage) => device.createBuffer({ size: bytes, usage });
+
+  const posBuf = mk(pos.byteLength, S | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+  device.queue.writeBuffer(posBuf, 0, pos);
+  const prevBuf = mk(pos.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(prevBuf, 0, pos);
+  const velBuf = mk(pos.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(velBuf, 0, new Float32Array(N * 4));
+
+  const totalC = groups.reduce((s, g) => s + g.a.length, 0);
+  const allA = new Uint32Array(totalC), allB = new Uint32Array(totalC);
+  const allR = new Float32Array(totalC);
+  let off = 0;
+  for (const g of groups) {
+    allA.set(g.a, off); allB.set(g.b, off); allR.set(g.rest, off);
+    g.base = off; off += g.a.length;
+  }
+  const aBuf = mk(allA.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(aBuf, 0, allA);
+  const bBuf = mk(allB.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(bBuf, 0, allB);
+  const rBuf = mk(allR.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(rBuf, 0, allR);
+  const lamBuf = mk(totalC * 4, S | GPUBufferUsage.COPY_DST);
+
+  // capsules: two vec4 each, radius packed into a.w
+  const capData = new Float32Array(capsules.length * 8);
+  capsules.forEach((c, i) => {
+    capData.set([c.a.x, c.a.y, c.a.z, c.r], i * 8);
+    capData.set([c.b.x, c.b.y, c.b.z, 0], i * 8 + 4);
+  });
+  const capBuf = mk(Math.max(capData.byteLength, 32), S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(capBuf, 0, capData);
+
+  const globalsBuf = device.createBuffer({
+    size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const slots = groups.reduce((s, g) => s + g.ranges.length, 0);
+  const paramsBuf = device.createBuffer({
+    size: slots * UNIFORM_STRIDE,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const module = device.createShaderModule({ code: SHADER });
+  const bgl0 = device.createBindGroupLayout({
+    entries: [
+      ...[0, 1, 2].map((b) => ({ binding: b, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "storage" } })),
+      ...[3, 4, 5].map((b) => ({ binding: b, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "read-only-storage" } })),
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    ],
+  });
+  const bgl1 = device.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 } }],
+  });
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
+  const pipe = (entryPoint) => device.createComputePipeline({
+    layout, compute: { module, entryPoint } });
+
+  const bind0 = device.createBindGroup({
+    layout: bgl0,
+    entries: [
+      { binding: 0, resource: { buffer: posBuf } },
+      { binding: 1, resource: { buffer: prevBuf } },
+      { binding: 2, resource: { buffer: velBuf } },
+      { binding: 3, resource: { buffer: aBuf } },
+      { binding: 4, resource: { buffer: bBuf } },
+      { binding: 5, resource: { buffer: rBuf } },
+      { binding: 6, resource: { buffer: lamBuf } },
+      { binding: 7, resource: { buffer: globalsBuf } },
+      { binding: 8, resource: { buffer: capBuf } },
+    ],
+  });
+  const bind1 = device.createBindGroup({
+    layout: bgl1, entries: [{ binding: 0, resource: { buffer: paramsBuf, size: 16 } }] });
+
+  const readBuf = device.createBuffer({
+    size: pos.byteLength, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+
+  gpu = {
+    posBuf, prevBuf, velBuf, lamBuf, globalsBuf, paramsBuf, readBuf, capBuf,
+    aBuf, bBuf, rBuf, bind0, bind1, totalC,
+    pipelines: {
+      predict: pipe("predict"), solve: pipe("solve"), collide: pipe("collide"),
+      updateVel: pipe("updateVel"), clearLambda: pipe("clearLambda"),
+    },
+    paramsData: new ArrayBuffer(slots * UNIFORM_STRIDE),
+  };
+  buildRenderMesh();
+}
+
+function stepGPU(dtFrame, doReadback) {
+  const dt = dtFrame / SUBSTEPS;
+
+  const view = new DataView(gpu.paramsData);
+  let slot = 0;
+  for (const g of sim.groups) {
+    const compliance = g.kind === 0 ? 0 : compBend;
+    for (const r of g.ranges) {
+      const o = slot * UNIFORM_STRIDE;
+      view.setFloat32(o, dt, true);
+      view.setFloat32(o + 4, compliance, true);
+      view.setUint32(o + 8, g.base + r.start, true);
+      view.setUint32(o + 12, r.count, true);
+      r.slot = slot; slot++;
+    }
+  }
+  device.queue.writeBuffer(gpu.paramsBuf, 0, gpu.paramsData);
+
+  const gb = new ArrayBuffer(32); const gv = new DataView(gb);
+  gv.setFloat32(0, dt, true);
+  gv.setFloat32(4, -9.81, true);
+  gv.setFloat32(8, friction, true);
+  gv.setUint32(16, sim.N, true);
+  gv.setUint32(20, capsules.length, true);
+  device.queue.writeBuffer(gpu.globalsBuf, 0, gb);
+
+  const enc = device.createCommandEncoder();
+  const pGroups = Math.ceil(sim.N / WORKGROUP);
+  const lGroups = Math.ceil(gpu.totalC / WORKGROUP);
+
+  for (let s = 0; s < SUBSTEPS; s++) {
+    const pass = enc.beginComputePass();
+    pass.setBindGroup(0, gpu.bind0);
+    pass.setBindGroup(1, gpu.bind1, [0]);
+
+    pass.setPipeline(gpu.pipelines.clearLambda);
+    pass.dispatchWorkgroups(lGroups);
+    pass.setPipeline(gpu.pipelines.predict);
+    pass.dispatchWorkgroups(pGroups);
+
+    for (let it = 0; it < iterations; it++) {
+      pass.setPipeline(gpu.pipelines.solve);
+      for (const g of sim.groups) {
+        for (const r of g.ranges) {
+          if (!r.count) continue;
+          pass.setBindGroup(1, gpu.bind1, [r.slot * UNIFORM_STRIDE]);
+          pass.dispatchWorkgroups(Math.ceil(r.count / WORKGROUP));
+        }
+      }
+      // Collision inside the iteration loop: pushing out once at the end
+      // would let the very next constraint pass drag the cloth back inside.
+      pass.setPipeline(gpu.pipelines.collide);
+      pass.setBindGroup(1, gpu.bind1, [0]);
+      pass.dispatchWorkgroups(pGroups);
+    }
+
+    pass.setPipeline(gpu.pipelines.updateVel);
+    pass.dispatchWorkgroups(pGroups);
+    pass.end();
+  }
+
+  if (doReadback) {
+    enc.copyBufferToBuffer(gpu.posBuf, 0, gpu.readBuf, 0, sim.pos.byteLength);
+  }
+  device.queue.submit([enc.finish()]);
+}
+
+// ---------- scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 100);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dl = new THREE.DirectionalLight(0xffffff, 1.15);
+dl.position.set(2, 4, 3);
+scene.add(dl);
+
+let bodyGroup = null, capsuleGroup = null, geometry = null, mesh = null, renderPos = null;
+
+function buildCapsuleDebug() {
+  if (capsuleGroup) scene.remove(capsuleGroup);
+  capsuleGroup = new THREE.Group();
+  capsuleGroup.visible = false;
+  const mat = new THREE.MeshBasicMaterial({ color: 0xff5599, wireframe: true });
+  for (const c of capsules) {
+    const dir = c.b.clone().sub(c.a);
+    const len = dir.length();
+    const g = new THREE.CapsuleGeometry(c.r, Math.max(len, 1e-4), 4, 8);
+    const m = new THREE.Mesh(g, mat);
+    m.position.copy(c.a).add(c.b).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+    capsuleGroup.add(m);
+  }
+  scene.add(capsuleGroup);
+}
+
+function buildRenderMesh() {
+  if (mesh) { scene.remove(mesh); geometry.dispose(); }
+  geometry = new THREE.BufferGeometry();
+  renderPos = new Float32Array(sim.N * 3);
+  geometry.setAttribute("position", new THREE.BufferAttribute(renderPos, 3));
+  const tri = [];
+  for (let r = 0; r < RES - 1; r++) {
+    for (let c = 0; c < RES - 1; c++) {
+      const a = sim.idx(c, r), b = sim.idx(c + 1, r);
+      const d = sim.idx(c, r + 1), e = sim.idx(c + 1, r + 1);
+      tri.push(a, d, b, b, d, e);
+    }
+  }
+  geometry.setIndex(tri);
+  mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+    color: 0xc94f4f, roughness: 0.8, side: THREE.DoubleSide }));
+  scene.add(mesh);
+}
+
+// ---------- ui ----------
+const $ = (id) => document.getElementById(id);
+function syncUI() {
+  compBend = $("cb").value == 0 ? 0 : Math.pow(10, -8 + $("cb").value / 12.5);
+  iterations = Number($("it").value);
+  friction = Number($("fr").value) / 100;
+  $("cbv").textContent = compBend.toExponential(1);
+  $("itv").textContent = iterations;
+  $("frv").textContent = $("fr").value;
+  $("rv").textContent = RES;
+}
+["cb", "it", "fr"].forEach((id) => $(id).addEventListener("input", syncUI));
+$("res").addEventListener("change", (e) => { RES = Number(e.target.value); createResources(); syncUI(); });
+addEventListener("keydown", (e) => {
+  if (e.key === "b" && bodyGroup) bodyGroup.visible = !bodyGroup.visible;
+  if (e.key === "c" && capsuleGroup) capsuleGroup.visible = !capsuleGroup.visible;
+  if (e.key === "w" && mesh) mesh.material.wireframe = !mesh.material.wireframe;
+  if (e.key === " ") { createResources(); e.preventDefault(); }
+});
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- boot ----------
+let last = performance.now(), frames = 0, acc = 0, fps = 0, gpuMs = 0;
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+
+  const t0 = performance.now();
+  const doReadback = gpu.readBuf.mapState === "unmapped";
+  stepGPU(dt, doReadback);
+  if (doReadback) {
+    const buf = gpu.readBuf, target = renderPos, geo = geometry, count = sim.N;
+    buf.mapAsync(GPUMapMode.READ).then(() => {
+      const src = new Float32Array(buf.getMappedRange());
+      for (let i = 0; i < count; i++) {
+        target[i * 3] = src[i * 4];
+        target[i * 3 + 1] = src[i * 4 + 1];
+        target[i * 3 + 2] = src[i * 4 + 2];
+      }
+      buf.unmap();
+      geo.attributes.position.needsUpdate = true;
+      geo.computeVertexNormals();
+    }).catch(() => {});
+  }
+  gpuMs = gpuMs * 0.9 + (performance.now() - t0) * 0.1;
+
+  frames++; acc += dt;
+  if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
+  stats.innerHTML =
+    `${sim.N.toLocaleString()} particles · ${gpu.totalC.toLocaleString()} constraints<br>` +
+    `${capsules.length} capsules · ${fps.toFixed(0)} fps · submit ${gpuMs.toFixed(2)} ms`;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+(async () => {
+  try {
+    await initGPU();
+    const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+    let skinned = null;
+    gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+    if (!skinned) throw new Error("no SkinnedMesh in bodytwin.glb");
+    skinned.frustumCulled = false;
+    skinned.material = new THREE.MeshStandardMaterial({
+      color: 0x8899aa, roughness: 0.85, side: THREE.DoubleSide });
+
+    bodyGroup = gltf.scene;
+    bodyGroup.updateMatrixWorld(true);
+    scene.add(bodyGroup);
+
+    bodyBox = new THREE.Box3().setFromObject(bodyGroup);
+    const c = bodyBox.getCenter(new THREE.Vector3());
+    camera.position.set(c.x + 0.4, c.y + 0.35, c.z + 2.1);
+    controls.target.copy(c);
+
+    capsules = buildCapsules(skinned);
+    buildCapsuleDebug();
+
+    createResources();
+    syncUI();
+    frame();
+  } catch (e) {
+    stats.textContent = "";
+    errEl.textContent = e.message;
+    console.error(e);
+  }
+})();
+</script>
+</body>
+</html>
