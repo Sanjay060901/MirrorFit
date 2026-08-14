@@ -105,12 +105,56 @@ export function averagePosition(bones, root) {
  * @returns [{ label, aBones, bBones, rx, rz, dz, elliptical }]
  */
 export function measureCapsules(skinned, root, spec) {
-  root.updateMatrixWorld(true);
+  // updateWorldMatrix(parents, children) — NOT updateMatrixWorld(force).
+  //
+  // The difference caused a genuinely nasty bug. updateMatrixWorld only walks
+  // DOWN, so it computed skinned.matrixWorld against whatever the parent's
+  // matrixWorld happened to hold — which, before the first render, is the
+  // identity. Then the very first bone.getWorldPosition() call internally does
+  // updateWorldMatrix(true, false), walking UP and refreshing the parent (and
+  // `root` with it) to its real 279x pixels-per-metre scale.
+  //
+  // Result: bone positions in the scaled chain, mesh vertices in the unscaled
+  // one, and worldToLocal dividing the vertices by a 279 they were never
+  // multiplied by. Every vertex collapsed to a speck at the origin, so no
+  // vertex fell within any capsule's t-band and the radii silently became
+  // "distance from the origin to this body part".
+  //
+  // Updating parents AND children puts the whole chain in one consistent state
+  // before anything is read from it.
+  root.updateWorldMatrix(true, true);
+
   const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
   const owners = dominantBoneNames(skinned);
   const posAttr = skinned.geometry.attributes.position;
 
   const toLocal = (v) => root.worldToLocal(v);
+
+  // Morph targets live on the GPU: shape fitting changes how the body LOOKS
+  // without touching geometry.attributes.position at all. Re-measuring after a
+  // fit therefore has to apply the influences by hand, or it measures the
+  // neutral body while the bones sit at the fitted one.
+  const morphs = skinned.geometry.morphAttributes?.position ?? null;
+  const influences = skinned.morphTargetInfluences ?? null;
+  const morphRelative = skinned.geometry.morphTargetsRelative !== false;
+  const _base = new THREE.Vector3();
+  const _mv = new THREE.Vector3();
+  const sampleVertex = (i, out) => {
+    out.fromBufferAttribute(posAttr, i);
+    if (morphs && influences) {
+      _base.copy(out);
+      for (let k = 0; k < morphs.length; k++) {
+        const w = influences[k];
+        if (!w) continue;
+        _mv.fromBufferAttribute(morphs[k], i);
+        // glTF morphs are deltas; a few other pipelines store absolute
+        // positions, hence the flag rather than an assumption.
+        if (!morphRelative) _mv.sub(_base);
+        out.addScaledVector(_mv, w);
+      }
+    }
+    return out.applyMatrix4(skinned.matrixWorld);
+  };
 
   const v = new THREE.Vector3();
   const ab = new THREE.Vector3();
@@ -135,7 +179,7 @@ export function measureCapsules(skinned, root, spec) {
     for (let i = 0; i < posAttr.count; i++) {
       if (!prefixes.some((p) => owners[i].startsWith(p))) continue;
 
-      v.fromBufferAttribute(posAttr, i).applyMatrix4(skinned.matrixWorld);
+      sampleVertex(i, v);
       toLocal(v);
       ap.subVectors(v, a);
       const t = THREE.MathUtils.clamp(ap.dot(ab) / denom, 0, 1);
@@ -211,7 +255,10 @@ export function measureCapsules(skinned, root, spec) {
  * quaternion) keeps this safe under the mirror's negative scale.
  */
 export function poseCapsules(caps, root, frame, dt) {
-  root.updateMatrixWorld(true);
+  // Parents too — see the note in measureCapsules. Here it matters every
+  // frame, because alignGroup's scale changes as the shopper moves toward or
+  // away from the camera.
+  root.updateWorldMatrix(true, true);
   for (const c of caps) {
     const a = averagePosition(c.aBones, root);
     const b = averagePosition(c.bBones, root);

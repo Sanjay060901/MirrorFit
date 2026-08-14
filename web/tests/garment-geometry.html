@@ -34,17 +34,51 @@ try {
   let skinned = null;
   gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
   const root = gltf.scene;
-  root.updateMatrixWorld(true);
+
+  // REPRODUCE THE LIVE PAGE'S TRANSFORM CHAIN. This is the whole reason the
+  // test is worth having: an earlier version measured the bare gltf.scene at
+  // the identity, passed cleanly, and the live page was badly broken anyway —
+  // because there the model hangs under a group carrying the metres-to-pixels
+  // scale and the mirror, and those had never been folded into the world
+  // matrices when measuring ran.
+  //
+  // Deliberately NOT calling updateMatrixWorld on the parent afterwards: the
+  // live page doesn't either before the first render, and that stale state is
+  // exactly the condition the bug needed.
+  const align = new THREE.Group();
+  align.add(root);
+  const PX_PER_M = 279;                 // what a 480 px frame works out to
+  align.scale.set(-PX_PER_M, PX_PER_M, PX_PER_M);   // negative x == the mirror
+  align.position.set(120, -40, 0);
+
   say(`model loaded: ${skinned.geometry.attributes.position.count} verts, ` +
       `${skinned.skeleton.bones.length} bones`);
+  say(`nested under a group at scale ${PX_PER_M} with a mirrored x axis`);
+
+  // Expected half-width / half-depth per capsule, read off body-slices.html.
+  // Anything more than 2 cm away means the capsule is not measuring the body
+  // part it claims to.
+  const EXPECT = {
+    chestUpper: [0.161, 0.082], chest: [0.146, 0.095], waist: [0.128, 0.086],
+    hips: [0.146, 0.094], neck: [0.036, 0.036],
+    shoulderL: [0.072, 0.072], shoulderR: [0.072, 0.072],
+    armL: [0.078, 0.078], armR: [0.078, 0.078],
+    forearmL: [0.064, 0.064], forearmR: [0.064, 0.064],
+  };
 
   const caps = measureCapsules(skinned, root, SPEC);
   say(`capsules measured: ${caps.length}/${SPEC.length}`);
+  let fails = 0;
   for (const c of caps) {
-    const bad = !isFinite(c.rx) || !isFinite(c.rz) || c.rx <= 0 || c.rz <= 0;
+    const e = EXPECT[c.label];
+    const off = e ? Math.max(Math.abs(c.rx - e[0]), Math.abs(c.rz - e[1])) : 0;
+    const bad = !isFinite(c.rx) || !isFinite(c.rz) || c.rx <= 0 || c.rz <= 0 || off > 0.02;
+    if (bad) fails++;
     say(`  ${c.label.padEnd(11)} rx=${c.rx.toFixed(3)} rz=${c.rz.toFixed(3)} ` +
-        `dz=${c.dz.toFixed(3)}${bad ? "   <<< BAD" : ""}`);
+        `dz=${c.dz.toFixed(3)}   expect ${e ? e.join("/") : "?"}` +
+        `${bad ? `   <<< OFF BY ${off.toFixed(3)} m` : "   ok"}`);
   }
+  say(fails ? `${fails} CAPSULE(S) FAILED` : "all capsules within 20 mm of the mesh");
 
   // Body frame from bone positions, exactly as the live page derives it.
   const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
