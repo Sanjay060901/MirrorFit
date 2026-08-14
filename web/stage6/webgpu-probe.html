@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 6.2 — WebGPU capability probe</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif;
+         padding: 28px; line-height: 1.7; }
+  h1 { font-size: 19px; font-weight: 600; }
+  table { border-collapse: collapse; margin: 14px 0; font-size: 13px; }
+  td { padding: 4px 16px 4px 0; vertical-align: top; }
+  td:first-child { color: #8ab; white-space: nowrap; }
+  .ok { color: #6d6; } .bad { color: #f77; } .warn { color: #fa0; }
+  pre { background: #1a1a1a; padding: 12px 14px; border-radius: 6px; font-size: 12px;
+        overflow-x: auto; }
+  #verdict { font-size: 15px; margin: 18px 0; padding: 12px 14px; border-radius: 6px;
+             background: #1a1a1a; }
+</style>
+</head>
+<body>
+<h1>WebGPU capability probe</h1>
+<div id="verdict">running…</div>
+<div id="out"></div>
+
+<script type="module">
+// Decides whether the XPBD cloth solver can move to GPU compute, and at what
+// scale. The numbers that matter for us:
+//   - compute shader support at all
+//   - maxStorageBufferBindingSize: particle + constraint buffers must fit
+//   - maxComputeInvocationsPerWorkgroup: how wide each dispatch can be
+//   - actual measured throughput, which is the only number that isn't a guess
+
+const out = document.getElementById("out");
+const verdict = document.getElementById("verdict");
+const rows = [];
+const row = (k, v, cls = "") => rows.push(
+  `<tr><td>${k}</td><td class="${cls}">${v}</td></tr>`);
+
+function flush() {
+  out.innerHTML = `<table>${rows.join("")}</table>`;
+}
+
+async function probe() {
+  if (!navigator.gpu) {
+    verdict.innerHTML = `<span class="bad">WebGPU unavailable.</span> ` +
+      `The browser exposes no navigator.gpu. On Chrome/Edge this usually means ` +
+      `an old version, a disabled flag, or unsupported hardware/driver.`;
+    row("navigator.gpu", "missing", "bad");
+    flush();
+    return;
+  }
+  row("navigator.gpu", "present", "ok");
+
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) {
+    verdict.innerHTML = `<span class="bad">No GPU adapter.</span> WebGPU exists but ` +
+      `no adapter could be acquired — typically a driver or blocklist issue.`;
+    flush();
+    return;
+  }
+
+  const info = adapter.info ?? (adapter.requestAdapterInfo
+    ? await adapter.requestAdapterInfo() : {});
+  row("vendor", info.vendor || "(hidden)");
+  row("architecture", info.architecture || "(hidden)");
+  row("description", info.description || info.device || "(hidden)");
+
+  const L = adapter.limits;
+  const fmtMB = (b) => `${(b / 1048576).toFixed(0)} MB`;
+  row("maxStorageBufferBindingSize", fmtMB(L.maxStorageBufferBindingSize));
+  row("maxBufferSize", fmtMB(L.maxBufferSize));
+  row("maxComputeWorkgroupSizeX", L.maxComputeWorkgroupSizeX);
+  row("maxComputeInvocationsPerWorkgroup", L.maxComputeInvocationsPerWorkgroup);
+  row("maxComputeWorkgroupsPerDimension", L.maxComputeWorkgroupsPerDimension.toLocaleString());
+  flush();
+
+  const device = await adapter.requestDevice();
+
+  // --- throughput test -------------------------------------------------
+  // Not a cloth solve, but the same shape of work: read two positions from a
+  // storage buffer, do distance-constraint-ish maths, write back. Enough to
+  // tell us whether the GPU is orders of magnitude faster than the 33 ns per
+  // constraint we measured in JS, or merely a bit faster.
+  const N = 1 << 20;                    // 1,048,576 "constraints"
+  const ITERS = 50;
+
+  const data = new Float32Array(N * 4);
+  for (let i = 0; i < N * 4; i++) data[i] = Math.random();
+
+  const buf = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  });
+  device.queue.writeBuffer(buf, 0, data);
+
+  const module = device.createShaderModule({
+    code: `
+      @group(0) @binding(0) var<storage, read_write> p: array<vec4<f32>>;
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let i = gid.x;
+        if (i >= arrayLength(&p)) { return; }
+        let a = p[i];
+        let b = p[(i + 1u) % arrayLength(&p)];
+        let d = a.xyz - b.xyz;
+        let len = max(length(d), 1e-9);
+        let c = len - 0.05;
+        let corr = (d / len) * (c * 0.5);
+        p[i] = vec4<f32>(a.xyz - corr, a.w);
+      }
+    `,
+  });
+
+  const pipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: { module, entryPoint: "main" },
+  });
+  const bind = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: buf } }],
+  });
+
+  // warm up so we don't time shader compilation and first-use allocation
+  for (let w = 0; w < 3; w++) {
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, bind);
+    pass.dispatchWorkgroups(Math.ceil(N / 64));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+  }
+  await device.queue.onSubmittedWorkDone();
+
+  const t0 = performance.now();
+  for (let k = 0; k < ITERS; k++) {
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, bind);
+    pass.dispatchWorkgroups(Math.ceil(N / 64));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+  }
+  await device.queue.onSubmittedWorkDone();
+  const ms = performance.now() - t0;
+
+  const total = N * ITERS;
+  const nsEach = (ms * 1e6) / total;
+  row("throughput test", `${total.toLocaleString()} ops in ${ms.toFixed(1)} ms`);
+  row("per constraint-op", `${nsEach.toFixed(3)} ns`, "ok");
+  row("vs CPU (33 ns measured)", `${(33 / nsEach).toFixed(0)}x faster`, "ok");
+
+  // What that speed implies for a real garment, using the CPU flag's shape of
+  // work: constraints x iterations x substeps per frame.
+  const perFrame = 29000 * 6 * 8;   // ~5k-particle garment
+  const budgetMs = (perFrame * nsEach) / 1e6;
+  row("projected 5k-vertex garment", `${budgetMs.toFixed(2)} ms/frame solve`,
+      budgetMs < 4 ? "ok" : budgetMs < 8 ? "warn" : "bad");
+  flush();
+
+  const verdictText = budgetMs < 4
+    ? `<span class="ok">WebGPU is viable.</span> A 5k-vertex garment projects to ` +
+      `~${budgetMs.toFixed(1)} ms of solve per frame, leaving room for pose ` +
+      `inference, skinning and rendering inside a 16.7 ms budget.`
+    : budgetMs < 8
+    ? `<span class="warn">WebGPU works but is tight.</span> ~${budgetMs.toFixed(1)} ms ` +
+      `for the solve leaves less headroom than we'd like — expect to reduce ` +
+      `garment resolution or iteration count.`
+    : `<span class="bad">GPU is slower than hoped.</span> ~${budgetMs.toFixed(1)} ms ` +
+      `for the solve alone. This machine likely has weak integrated graphics; ` +
+      `the kiosk's discrete GPU would change this number substantially.`;
+
+  verdict.innerHTML = verdictText +
+    `<br><br><small>Note: this measures raw compute throughput, not the real ` +
+    `solver. Graph-coloured dispatches add synchronisation between colours, so ` +
+    `treat this as an optimistic upper bound.</small>`;
+
+  device.destroy?.();
+}
+
+probe().catch((e) => {
+  verdict.innerHTML = `<span class="bad">Probe failed:</span> ${e.message}`;
+  console.error(e);
+});
+</script>
+</body>
+</html>
