@@ -24,7 +24,7 @@
   <label>cloth res <input id="res" type="range" min="24" max="96" value="56" step="8" /> <span id="rv">56</span></label>
   <label>bend compliance <input id="cb" type="range" min="0" max="100" value="42" /> <span id="cbv">42</span></label>
   <label>iterations <input id="it" type="range" min="1" max="20" value="8" /> <span id="itv">8</span></label>
-  <label>friction <input id="fr" type="range" min="0" max="100" value="55" /> <span id="frv">55</span></label>
+  <label>friction <input id="fr" type="range" min="0" max="100" value="85" /> <span id="frv">85</span></label>
   <div><span class="k">b</span> body · <span class="k">c</span> capsules · <span class="k">w</span> wireframe · <span class="k">space</span> drop again</div>
 </div>
 
@@ -284,6 +284,17 @@ fn collide(@builtin(global_invocation_id) gid : vec3<u32>) {
       // direction, so pick an arbitrary one rather than dividing by zero.
       var n = select(d / max(dist, 1e-9), vec3<f32>(0.0, 1.0, 0.0), dist < 1e-6);
       p3 = closest + n * r;
+
+      // POSITION-based friction, applied at the moment of contact.
+      // Damping velocity afterwards (as updateVel does) is too weak: by then
+      // the particle has already slid. Instead, undo part of the tangential
+      // displacement it made since the last substep — the component of motion
+      // ALONG the surface. This is what lets cloth grip a shoulder instead of
+      // sheeting off it.
+      let dp = p3 - prevPos[i].xyz;
+      let dpn = dot(dp, n) * n;
+      let dpt = dp - dpn;
+      p3 = p3 - dpt * g.friction;
     }
   }
   pos[i] = vec4<f32>(p3, w);
