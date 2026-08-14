@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 6.2 — XPBD cloth on WebGPU</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.72);
+        padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.8; }
+  #ui label { display: block; }
+  input[type=range] { width: 165px; vertical-align: middle; }
+  .k { color: #7ab; font-weight: 600; }
+  #stats { color: #8c8; }
+  #err { color: #f77; max-width: 460px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Stage 6.2 — XPBD on WebGPU</b></div>
+  <div id="stats">initialising…</div>
+  <div id="err"></div>
+  <hr style="border-color:#333" />
+  <label>grid <input id="grid" type="range" min="20" max="120" value="60" step="4" /> <span id="gv">60</span></label>
+  <label>stretch compliance <input id="cs" type="range" min="0" max="100" value="0" /> <span id="csv">0</span></label>
+  <label>bend compliance <input id="cb" type="range" min="0" max="100" value="45" /> <span id="cbv">45</span></label>
+  <label>iterations <input id="it" type="range" min="1" max="20" value="6" /> <span id="itv">6</span></label>
+  <label>wind <input id="wd" type="range" min="0" max="100" value="45" /> <span id="wv">45</span></label>
+  <div><span class="k">w</span> wireframe · <span class="k">space</span> reset</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+// ---- Stage 6.2: XPBD cloth as GPU compute ----
+//
+// Same solver as web/stage6/cloth-flag.html — deliberately, so the two can be
+// compared. If this one behaves differently, the shader is wrong, not the
+// algorithm.
+//
+// THE PROBLEM GPU PARALLELISM CREATES
+// Constraint solving on CPU is Gauss-Seidel: each constraint sees the
+// corrections made by the previous one. On GPU thousands run at once, and any
+// two constraints sharing a particle would read-modify-write the same memory
+// simultaneously. That race doesn't crash — it quietly loses corrections, and
+// the cloth jitters or slowly stretches.
+//
+// THE FIX: GRAPH COLOURING
+// Partition constraints into colours where no two constraints in a colour
+// touch the same particle, then dispatch one colour at a time. Within a
+// colour every write targets a distinct particle, so parallelism is safe;
+// between colours the dispatch boundary acts as the barrier. This preserves
+// Gauss-Seidel convergence rather than degrading to Jacobi averaging.
+//
+// The colouring is computed greedily at init. It could be derived
+// analytically for a regular grid, but greedy also handles the irregular
+// constraint graph a real garment mesh will have.
+
+const stats = document.getElementById("stats");
+const errEl = document.getElementById("err");
+
+let device = null;
+let sim = null;          // everything that depends on grid size
+let COLS = 60, ROWS = 42;
+const SPACING = 0.035;
+const SUBSTEPS = 8;
+const WORKGROUP = 64;
+
+let compStretch = 0, compBend = 0.45, iterations = 6, windStrength = 0.54;
+
+// ---------- colouring ----------
+function greedyColour(cA, cB, numParticles) {
+  const n = cA.length;
+  // particle -> constraints touching it
+  const head = new Int32Array(numParticles).fill(-1);
+  const next = new Int32Array(n * 2).fill(-1);
+  const owner = new Int32Array(n * 2);
+  let e = 0;
+  for (let k = 0; k < n; k++) {
+    for (const p of [cA[k], cB[k]]) {
+      owner[e] = k; next[e] = head[p]; head[p] = e; e++;
+    }
+  }
+
+  const colour = new Int32Array(n).fill(-1);
+  const used = new Uint8Array(64);
+  let maxColour = 0;
+
+  for (let k = 0; k < n; k++) {
+    used.fill(0);
+    for (const p of [cA[k], cB[k]]) {
+      for (let it = head[p]; it !== -1; it = next[it]) {
+        const other = owner[it];
+        if (other !== k && colour[other] >= 0) used[colour[other]] = 1;
+      }
+    }
+    let c = 0;
+    while (c < used.length && used[c]) c++;
+    colour[k] = c;
+    if (c > maxColour) maxColour = c;
+  }
+  return { colour, numColours: maxColour + 1 };
+}
+
+// ---------- build simulation data ----------
+function buildSim() {
+  const N = COLS * ROWS;
+  const idx = (c, r) => r * COLS + c;
+
+  // vec4 per particle: xyz + invMass in w. Packing invMass into w saves a
+  // separate buffer and a separate read in every shader.
+  const pos = new Float32Array(N * 4);
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const i = idx(c, r);
+      pos[i * 4] = c * SPACING;
+      pos[i * 4 + 1] = -r * SPACING;
+      pos[i * 4 + 2] = 0;
+      pos[i * 4 + 3] = c === 0 ? 0 : 1;   // w = invMass; 0 pins the left edge
+    }
+  }
+
+  const A = [], B = [], rest = [], kind = [];   // kind 0 = stretch, 1 = bend
+  const add = (a, b, k) => {
+    A.push(a); B.push(b); kind.push(k);
+    rest.push(Math.hypot(
+      pos[a * 4] - pos[b * 4],
+      pos[a * 4 + 1] - pos[b * 4 + 1],
+      pos[a * 4 + 2] - pos[b * 4 + 2]));
+  };
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (c + 1 < COLS) add(idx(c, r), idx(c + 1, r), 0);
+      if (r + 1 < ROWS) add(idx(c, r), idx(c, r + 1), 0);
+      if (c + 1 < COLS && r + 1 < ROWS) {
+        add(idx(c, r), idx(c + 1, r + 1), 0);
+        add(idx(c + 1, r), idx(c, r + 1), 0);
+      }
+      if (c + 2 < COLS) add(idx(c, r), idx(c + 2, r), 1);
+      if (r + 2 < ROWS) add(idx(c, r), idx(c, r + 2), 1);
+    }
+  }
+
+  // Colour stretch and bend separately: they're dispatched separately anyway
+  // (different compliance), so sharing a colouring would only over-constrain
+  // both.
+  const groups = [];
+  for (const wantKind of [0, 1]) {
+    const map = [];
+    for (let k = 0; k < A.length; k++) if (kind[k] === wantKind) map.push(k);
+    const sa = map.map((k) => A[k]);
+    const sb = map.map((k) => B[k]);
+    const { colour, numColours } = greedyColour(sa, sb, N);
+
+    // sort into contiguous runs per colour so each dispatch is a slice
+    const order = map.map((_, i) => i).sort((x, y) => colour[x] - colour[y]);
+    const ranges = [];
+    let start = 0;
+    for (let c = 0; c < numColours; c++) {
+      const count = order.filter((i) => colour[i] === c).length;
+      ranges.push({ start, count });
+      start += count;
+    }
+    groups.push({
+      kind: wantKind,
+      a: new Uint32Array(order.map((i) => sa[i])),
+      b: new Uint32Array(order.map((i) => sb[i])),
+      rest: new Float32Array(order.map((i) => rest[map[i]])),
+      ranges,
+    });
+  }
+
+  return { N, pos, groups, idx };
+}
+
+// ---------- GPU resources ----------
+const SHADER = `
+struct Params {
+  dt : f32,
+  compliance : f32,
+  colourOffset : u32,
+  colourCount : u32,
+};
+struct Globals {
+  dt : f32,
+  gravity : f32,
+  wind : f32,
+  time : f32,
+  numParticles : u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> pos : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> prevPos : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> vel : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> cA : array<u32>;
+@group(0) @binding(4) var<storage, read> cB : array<u32>;
+@group(0) @binding(5) var<storage, read> cRest : array<f32>;
+@group(0) @binding(6) var<storage, read_write> lambda : array<f32>;
+@group(0) @binding(7) var<uniform> g : Globals;
+@group(1) @binding(0) var<uniform> p : Params;
+
+@compute @workgroup_size(64)
+fn predict(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= g.numParticles) { return; }
+  let w = pos[i].w;
+  if (w == 0.0) { return; }          // pinned
+  var v = vel[i].xyz;
+  let gust = g.wind * (0.6 + 0.4 * sin(g.time * 2.1 + f32(i) * 0.05));
+  v.y = v.y + g.gravity * g.dt;
+  v.z = v.z + gust * g.dt;
+  v = v * 0.999;
+  prevPos[i] = pos[i];
+  pos[i] = vec4<f32>(pos[i].xyz + v * g.dt, w);
+  vel[i] = vec4<f32>(v, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn solve(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= p.colourCount) { return; }
+  let k = gid.x + p.colourOffset;
+  let a = cA[k];
+  let b = cB[k];
+  let pa = pos[a];
+  let pb = pos[b];
+  let wa = pa.w;
+  let wb = pb.w;
+  let wsum = wa + wb;
+  if (wsum == 0.0) { return; }
+  var d = pa.xyz - pb.xyz;
+  let len = length(d);
+  if (len < 1e-9) { return; }
+  let C = len - cRest[k];
+  let alpha = p.compliance / (p.dt * p.dt);
+  let dl = (-C - alpha * lambda[k]) / (wsum + alpha);
+  lambda[k] = lambda[k] + dl;
+  let corr = d * (dl / len);
+  // Safe without atomics: within a colour no two constraints share a
+  // particle, so these writes never collide.
+  if (wa > 0.0) { pos[a] = vec4<f32>(pa.xyz + corr * wa, wa); }
+  if (wb > 0.0) { pos[b] = vec4<f32>(pb.xyz - corr * wb, wb); }
+}
+
+@compute @workgroup_size(64)
+fn updateVel(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= g.numParticles) { return; }
+  if (pos[i].w == 0.0) { return; }
+  vel[i] = vec4<f32>((pos[i].xyz - prevPos[i].xyz) / g.dt, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn clearLambda(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= arrayLength(&lambda)) { return; }
+  lambda[gid.x] = 0.0;
+}
+`;
+
+const UNIFORM_STRIDE = 256;   // minUniformBufferOffsetAlignment worst case
+let gpu = null;
+
+async function initGPU() {
+  if (!navigator.gpu) throw new Error("WebGPU unavailable — see webgpu-probe.html");
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw new Error("no GPU adapter");
+  device = await adapter.requestDevice();
+  device.lost.then((info) => {
+    errEl.textContent = `GPU device lost: ${info.message || info.reason}`;
+  });
+}
+
+function createResources() {
+  // Release the old buffers. Any readback still in flight against them will
+  // reject, and its handler drops that frame — harmless, because the new
+  // buffers get their own readback next frame.
+  if (gpu) {
+    for (const b of [gpu.posBuf, gpu.prevBuf, gpu.velBuf, gpu.lamBuf,
+                     gpu.globalsBuf, gpu.paramsBuf, gpu.readBuf]) {
+      try { b.destroy(); } catch { /* already gone */ }
+    }
+  }
+
+  sim = buildSim();
+  const { N, pos, groups } = sim;
+
+  const mk = (bytes, usage) => device.createBuffer({ size: bytes, usage });
+  const S = GPUBufferUsage.STORAGE;
+
+  const posBuf = mk(pos.byteLength, S | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+  device.queue.writeBuffer(posBuf, 0, pos);
+  const prevBuf = mk(pos.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(prevBuf, 0, pos);
+  const velBuf = mk(pos.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(velBuf, 0, new Float32Array(N * 4));
+
+  // Both constraint groups share one set of buffers, concatenated, so the
+  // shader needs only one binding. Each group records its base offset.
+  const totalC = groups.reduce((s, gp) => s + gp.a.length, 0);
+  const allA = new Uint32Array(totalC);
+  const allB = new Uint32Array(totalC);
+  const allR = new Float32Array(totalC);
+  let off = 0;
+  for (const gp of groups) {
+    allA.set(gp.a, off); allB.set(gp.b, off); allR.set(gp.rest, off);
+    gp.base = off;
+    off += gp.a.length;
+  }
+
+  const aBuf = mk(allA.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(aBuf, 0, allA);
+  const bBuf = mk(allB.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(bBuf, 0, allB);
+  const rBuf = mk(allR.byteLength, S | GPUBufferUsage.COPY_DST);
+  device.queue.writeBuffer(rBuf, 0, allR);
+  const lamBuf = mk(totalC * 4, S | GPUBufferUsage.COPY_DST);
+
+  const globalsBuf = device.createBuffer({
+    size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // One Params slot per (group, colour), addressed by dynamic offset. This is
+  // how a single bind group serves every dispatch without rebuilding it.
+  const slots = groups.reduce((s, gp) => s + gp.ranges.length, 0);
+  const paramsBuf = device.createBuffer({
+    size: slots * UNIFORM_STRIDE,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const module = device.createShaderModule({ code: SHADER });
+
+  const bgl0 = device.createBindGroupLayout({
+    entries: [
+      ...[0, 1, 2].map((b) => ({ binding: b, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "storage" } })),
+      ...[3, 4, 5].map((b) => ({ binding: b, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "read-only-storage" } })),
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const bgl1 = device.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 } }],
+  });
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
+
+  const pipe = (entryPoint) => device.createComputePipeline({
+    layout, compute: { module, entryPoint } });
+
+  const bind0 = device.createBindGroup({
+    layout: bgl0,
+    entries: [
+      { binding: 0, resource: { buffer: posBuf } },
+      { binding: 1, resource: { buffer: prevBuf } },
+      { binding: 2, resource: { buffer: velBuf } },
+      { binding: 3, resource: { buffer: aBuf } },
+      { binding: 4, resource: { buffer: bBuf } },
+      { binding: 5, resource: { buffer: rBuf } },
+      { binding: 6, resource: { buffer: lamBuf } },
+      { binding: 7, resource: { buffer: globalsBuf } },
+    ],
+  });
+  const bind1 = device.createBindGroup({
+    layout: bgl1,
+    entries: [{ binding: 0, resource: { buffer: paramsBuf, size: 16 } }],
+  });
+
+  // readback buffer for pulling positions to the CPU for rendering
+  const readBuf = device.createBuffer({
+    size: pos.byteLength,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  gpu = {
+    posBuf, prevBuf, velBuf, lamBuf, globalsBuf, paramsBuf, readBuf,
+    bind0, bind1, totalC,
+    pipelines: {
+      predict: pipe("predict"), solve: pipe("solve"),
+      updateVel: pipe("updateVel"), clearLambda: pipe("clearLambda"),
+    },
+    paramsData: new ArrayBuffer(slots * UNIFORM_STRIDE),
+  };
+
+  buildRenderMesh();
+}
+
+function writeParams(dt) {
+  // Rewritten each substep because dt and the compliance sliders can change.
+  const view = new DataView(gpu.paramsData);
+  let slot = 0;
+  for (const gp of sim.groups) {
+    const compliance = gp.kind === 0 ? compStretch : compBend;
+    for (const r of gp.ranges) {
+      const o = slot * UNIFORM_STRIDE;
+      view.setFloat32(o, dt, true);
+      view.setFloat32(o + 4, compliance, true);
+      view.setUint32(o + 8, gp.base + r.start, true);
+      view.setUint32(o + 12, r.count, true);
+      r.slot = slot;
+      slot++;
+    }
+  }
+  device.queue.writeBuffer(gpu.paramsBuf, 0, gpu.paramsData);
+}
+
+function stepGPU(dtFrame, doReadback) {
+  const dt = dtFrame / SUBSTEPS;
+  writeParams(dt);
+
+  const globals = new ArrayBuffer(32);
+  const gv = new DataView(globals);
+  gv.setFloat32(0, dt, true);
+  gv.setFloat32(4, -9.81, true);
+  gv.setFloat32(8, windStrength, true);
+  gv.setFloat32(12, performance.now() / 1000, true);
+  gv.setUint32(16, sim.N, true);
+  device.queue.writeBuffer(gpu.globalsBuf, 0, globals);
+
+  const enc = device.createCommandEncoder();
+  const particleGroups = Math.ceil(sim.N / WORKGROUP);
+  const lambdaGroups = Math.ceil(gpu.totalC / WORKGROUP);
+
+  for (let s = 0; s < SUBSTEPS; s++) {
+    let pass = enc.beginComputePass();
+
+    pass.setPipeline(gpu.pipelines.clearLambda);
+    pass.setBindGroup(0, gpu.bind0);
+    pass.setBindGroup(1, gpu.bind1, [0]);
+    pass.dispatchWorkgroups(lambdaGroups);
+
+    pass.setPipeline(gpu.pipelines.predict);
+    pass.dispatchWorkgroups(particleGroups);
+
+    pass.setPipeline(gpu.pipelines.solve);
+    for (let it = 0; it < iterations; it++) {
+      for (const gp of sim.groups) {
+        for (const r of gp.ranges) {
+          if (r.count === 0) continue;
+          // Each dispatch is one colour. Consecutive dispatches in a pass are
+          // ordered, which is exactly the barrier the colouring relies on.
+          pass.setBindGroup(1, gpu.bind1, [r.slot * UNIFORM_STRIDE]);
+          pass.dispatchWorkgroups(Math.ceil(r.count / WORKGROUP));
+        }
+      }
+    }
+
+    pass.setPipeline(gpu.pipelines.updateVel);
+    pass.setBindGroup(1, gpu.bind1, [0]);
+    pass.dispatchWorkgroups(particleGroups);
+
+    pass.end();
+  }
+
+  // Only copy when the readback buffer is free. A mapped (or pending-map)
+  // buffer cannot be a copy destination — doing it anyway is what produced
+  // "used in submit while mapped". The simulation keeps running either way;
+  // we just skip refreshing the render snapshot for a frame.
+  if (doReadback) {
+    enc.copyBufferToBuffer(gpu.posBuf, 0, gpu.readBuf, 0, sim.pos.byteLength);
+  }
+  device.queue.submit([enc.finish()]);
+}
+
+// ---------- rendering ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(1.1, -0.7, 2.6);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dl = new THREE.DirectionalLight(0xffffff, 1.1);
+dl.position.set(1, 2, 3);
+scene.add(dl);
+
+let geometry = null, mesh = null, renderPos = null;
+
+function buildRenderMesh() {
+  if (mesh) { scene.remove(mesh); geometry.dispose(); }
+  geometry = new THREE.BufferGeometry();
+  renderPos = new Float32Array(sim.N * 3);
+  geometry.setAttribute("position", new THREE.BufferAttribute(renderPos, 3));
+  const tri = [];
+  const idx = sim.idx;
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS - 1; c++) {
+      const a = idx(c, r), b = idx(c + 1, r), d = idx(c, r + 1), e = idx(c + 1, r + 1);
+      tri.push(a, d, b, b, d, e);
+    }
+  }
+  geometry.setIndex(tri);
+  mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+    color: 0x4e8cff, roughness: 0.75, side: THREE.DoubleSide,
+  }));
+  scene.add(mesh);
+  controls.target.set(COLS * SPACING * 0.5, -ROWS * SPACING * 0.5, 0);
+}
+
+// ---------- ui ----------
+const $ = (id) => document.getElementById(id);
+function syncUI() {
+  compStretch = $("cs").value == 0 ? 0 : Math.pow(10, -8 + $("cs").value / 12.5);
+  compBend = $("cb").value == 0 ? 0 : Math.pow(10, -8 + $("cb").value / 12.5);
+  iterations = Number($("it").value);
+  windStrength = Number($("wd").value) / 100 * 1.2;
+  $("csv").textContent = compStretch.toExponential(1);
+  $("cbv").textContent = compBend.toExponential(1);
+  $("itv").textContent = iterations;
+  $("wv").textContent = $("wd").value;
+  $("gv").textContent = COLS;
+}
+["cs", "cb", "it", "wd"].forEach((id) => $(id).addEventListener("input", syncUI));
+$("grid").addEventListener("change", (e) => {
+  COLS = Number(e.target.value);
+  ROWS = Math.round(COLS * 0.7);
+  createResources();
+  syncUI();
+});
+addEventListener("keydown", (e) => {
+  if (e.key === "w" && mesh) mesh.material.wireframe = !mesh.material.wireframe;
+  if (e.key === " ") { createResources(); e.preventDefault(); }
+});
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- main loop ----------
+let last = performance.now(), frames = 0, acc = 0, fps = 0;
+let gpuMs = 0;
+
+async function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  const dtFrame = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+
+  const t0 = performance.now();
+
+  // Ask the buffer, don't track it ourselves. GPUBuffer.mapState is
+  // authoritative ("unmapped" | "pending" | "mapped"); a hand-rolled flag has
+  // a window between mapAsync resolving and our .then() running where the
+  // buffer is already mapped but the flag still says otherwise — which is
+  // exactly the residual "used in submit while mapped" error.
+  const doReadback = gpu.readBuf.mapState === "unmapped";
+  stepGPU(dtFrame, doReadback);
+
+  // Read positions back for WebGL rendering. This copy is the main cost of
+  // keeping Three.js as the renderer — a pure WebGPU renderer would share the
+  // buffer and skip it entirely.
+  if (doReadback) {
+    const buf = gpu.readBuf;          // capture: a grid change can swap gpu.readBuf
+    const target = renderPos;
+    const geo = geometry;
+    const count = sim.N;
+    buf.mapAsync(GPUMapMode.READ).then(() => {
+      const src = new Float32Array(buf.getMappedRange());
+      for (let i = 0; i < count; i++) {
+        target[i * 3] = src[i * 4];
+        target[i * 3 + 1] = src[i * 4 + 1];
+        target[i * 3 + 2] = src[i * 4 + 2];
+      }
+      buf.unmap();
+      geo.attributes.position.needsUpdate = true;
+      geo.computeVertexNormals();
+    }).catch(() => { /* buffer destroyed by a grid change — drop this frame */ });
+  }
+  gpuMs = gpuMs * 0.9 + (performance.now() - t0) * 0.1;
+
+  frames++; acc += dtFrame;
+  if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
+  const colours = sim.groups.reduce((s, g) => s + g.ranges.length, 0);
+  stats.innerHTML =
+    `${sim.N.toLocaleString()} particles · ${gpu.totalC.toLocaleString()} constraints<br>` +
+    `${colours} colours · ${fps.toFixed(0)} fps · submit ${gpuMs.toFixed(2)} ms`;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+(async () => {
+  try {
+    await initGPU();
+    createResources();
+    syncUI();
+    frame();
+  } catch (e) {
+    stats.textContent = "";
+    errEl.textContent = e.message;
+    console.error(e);
+  }
+})();
+</script>
+</body>
+</html>
