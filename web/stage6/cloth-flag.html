@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 6.3 — XPBD cloth (flag)</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.72);
+        padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.8; }
+  #ui label { display: block; }
+  input[type=range] { width: 170px; vertical-align: middle; }
+  .k { color: #7ab; font-weight: 600; }
+  #stats { color: #8c8; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Stage 6.3 — XPBD cloth</b></div>
+  <div id="stats">…</div>
+  <hr style="border-color:#333" />
+  <label>stretch compliance <input id="compStretch" type="range" min="0" max="100" value="0" /> <span id="csv">0</span></label>
+  <label>bend compliance <input id="compBend" type="range" min="0" max="100" value="45" /> <span id="cbv">45</span></label>
+  <label>iterations <input id="iters" type="range" min="1" max="20" value="8" /> <span id="itv">8</span></label>
+  <label>wind <input id="wind" type="range" min="0" max="100" value="35" /> <span id="wv">35</span></label>
+  <div><span class="k">w</span> wireframe · <span class="k">p</span> particles · <span class="k">space</span> reset</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+// ---- Stage 6.3: XPBD cloth, CPU ----
+//
+// Position-based dynamics inverts the usual physics loop. Instead of
+//   force -> acceleration -> velocity -> position
+// it does
+//   predict position -> fix positions until constraints hold -> infer velocity
+//
+// That inversion is why it's stable: a stiff spring integrated explicitly
+// will explode if dt is too large for its stiffness, but "move the points
+// until they're the right distance apart" cannot. The worst case is that
+// constraints are only partially satisfied, which looks like softer cloth,
+// not an explosion.
+//
+// The XPBD part (Macklin et al. 2016) adds COMPLIANCE, alpha = 1/stiffness,
+// scaled by dt^2. Plain PBD's stiffness silently depended on iteration count
+// and timestep — same cloth, different framerate, different behaviour. With
+// compliance, stiffness is a material property you set in physical units and
+// iterations only affect convergence, not the result. Try it: change the
+// iteration slider and note the cloth doesn't get stiffer, just cleaner.
+
+const COLS = 40, ROWS = 28;      // particle grid
+const SPACING = 0.06;            // metres between particles
+const SUBSTEPS = 8;              // XPBD prefers many substeps over many iterations
+const GRAVITY = -9.81;
+
+const N = COLS * ROWS;
+const pos = new Float32Array(N * 3);
+const prev = new Float32Array(N * 3);
+const vel = new Float32Array(N * 3);
+const invMass = new Float32Array(N);
+
+const idx = (c, r) => r * COLS + c;
+
+// Constraint arrays: flat pairs + rest lengths + a lambda accumulator.
+// Separated into stretch and bend because they want different compliance —
+// real fabric resists stretching far more than it resists folding, and that
+// ratio is most of what makes a material read as denim vs silk.
+const stretchA = [], stretchB = [], stretchRest = [];
+const bendA = [], bendB = [], bendRest = [];
+
+function addConstraint(a, b, arrA, arrB, arrRest) {
+  arrA.push(a); arrB.push(b);
+  const dx = pos[a * 3] - pos[b * 3];
+  const dy = pos[a * 3 + 1] - pos[b * 3 + 1];
+  const dz = pos[a * 3 + 2] - pos[b * 3 + 2];
+  arrRest.push(Math.hypot(dx, dy, dz));
+}
+
+function build() {
+  stretchA.length = stretchB.length = stretchRest.length = 0;
+  bendA.length = bendB.length = bendRest.length = 0;
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const i = idx(c, r);
+      pos[i * 3] = c * SPACING;
+      pos[i * 3 + 1] = -r * SPACING;
+      pos[i * 3 + 2] = 0;
+      prev[i * 3] = pos[i * 3];
+      prev[i * 3 + 1] = pos[i * 3 + 1];
+      prev[i * 3 + 2] = pos[i * 3 + 2];
+      vel[i * 3] = vel[i * 3 + 1] = vel[i * 3 + 2] = 0;
+      // invMass 0 == infinitely heavy == pinned. Pinning the left column is
+      // what makes this a flag rather than a falling sheet.
+      invMass[i] = c === 0 ? 0 : 1;
+    }
+  }
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      // structural: right and down
+      if (c + 1 < COLS) addConstraint(idx(c, r), idx(c + 1, r), stretchA, stretchB, stretchRest);
+      if (r + 1 < ROWS) addConstraint(idx(c, r), idx(c, r + 1), stretchA, stretchB, stretchRest);
+      // shear: diagonals. Without these the grid folds flat like a hinge —
+      // a square lattice has no resistance to shearing at all.
+      if (c + 1 < COLS && r + 1 < ROWS) {
+        addConstraint(idx(c, r), idx(c + 1, r + 1), stretchA, stretchB, stretchRest);
+        addConstraint(idx(c + 1, r), idx(c, r + 1), stretchA, stretchB, stretchRest);
+      }
+      // bend: two apart. These resist folding, not stretching, which is why
+      // they get their own (much higher) compliance.
+      if (c + 2 < COLS) addConstraint(idx(c, r), idx(c + 2, r), bendA, bendB, bendRest);
+      if (r + 2 < ROWS) addConstraint(idx(c, r), idx(c, r + 2), bendA, bendB, bendRest);
+    }
+  }
+}
+
+const lambdaStretch = new Float32Array(20000);
+const lambdaBend = new Float32Array(20000);
+
+// The core XPBD distance projection.
+//
+//   C      = |p_a - p_b| - rest                (constraint violation)
+//   alpha~ = compliance / dt^2                 (compliance, time-scaled)
+//   dLambda = (-C - alpha~ * lambda) / (w_a + w_b + alpha~)
+//
+// The alpha~*lambda term is the entire difference from plain PBD: it
+// remembers how much force this constraint has already applied this step, so
+// the constraint converges to a physically-defined stiffness instead of
+// "however stiff N iterations happened to make it".
+function solveDistance(A, B, rest, lambda, compliance, dt) {
+  const alpha = compliance / (dt * dt);
+  for (let k = 0; k < A.length; k++) {
+    const a = A[k], b = B[k];
+    const wa = invMass[a], wb = invMass[b];
+    const wsum = wa + wb;
+    if (wsum === 0) continue;               // both pinned, nothing to do
+
+    const ax = a * 3, bx = b * 3;
+    let dx = pos[ax] - pos[bx];
+    let dy = pos[ax + 1] - pos[bx + 1];
+    let dz = pos[ax + 2] - pos[bx + 2];
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-9) continue;               // coincident points have no gradient
+
+    const C = len - rest[k];
+    const dl = (-C - alpha * lambda[k]) / (wsum + alpha);
+    lambda[k] += dl;
+
+    const s = dl / len;                     // fold the normalisation into the scale
+    dx *= s; dy *= s; dz *= s;
+
+    if (wa > 0) { pos[ax] += wa * dx; pos[ax + 1] += wa * dy; pos[ax + 2] += wa * dz; }
+    if (wb > 0) { pos[bx] -= wb * dx; pos[bx + 1] -= wb * dy; pos[bx + 2] -= wb * dz; }
+  }
+}
+
+let windStrength = 0.35;
+let compStretch = 0, compBend = 0.45;
+let iterations = 8;
+
+function step(dtFrame) {
+  // Substepping beats iterating: XPBD converges far better with many small
+  // steps than with one large step solved many times, for the same total work.
+  const dt = dtFrame / SUBSTEPS;
+  const time = performance.now() / 1000;
+
+  for (let s = 0; s < SUBSTEPS; s++) {
+    // --- predict ---
+    for (let i = 0; i < N; i++) {
+      if (invMass[i] === 0) continue;
+      const i3 = i * 3;
+      // wind: gusty rather than constant, and pushing along +z so the flag
+      // billows toward the viewer
+      const gust = windStrength * (0.6 + 0.4 * Math.sin(time * 2.1 + i * 0.05));
+      vel[i3] += 0 * dt;
+      vel[i3 + 1] += GRAVITY * dt;
+      vel[i3 + 2] += gust * dt;
+
+      // light damping keeps it from oscillating forever
+      vel[i3] *= 0.999; vel[i3 + 1] *= 0.999; vel[i3 + 2] *= 0.999;
+
+      prev[i3] = pos[i3]; prev[i3 + 1] = pos[i3 + 1]; prev[i3 + 2] = pos[i3 + 2];
+      pos[i3] += vel[i3] * dt;
+      pos[i3 + 1] += vel[i3 + 1] * dt;
+      pos[i3 + 2] += vel[i3 + 2] * dt;
+    }
+
+    // --- solve ---
+    // Lambdas reset each substep: they accumulate force within a step, not
+    // across steps. Forgetting this reset is a classic XPBD bug — the cloth
+    // slowly goes rigid as stale lambdas pile up.
+    lambdaStretch.fill(0, 0, stretchA.length);
+    lambdaBend.fill(0, 0, bendA.length);
+    for (let it = 0; it < iterations; it++) {
+      solveDistance(stretchA, stretchB, stretchRest, lambdaStretch, compStretch, dt);
+      solveDistance(bendA, bendB, bendRest, lambdaBend, compBend, dt);
+    }
+
+    // --- infer velocity from the position change ---
+    // This is the "position-based" part: velocity is an OUTPUT, not something
+    // we integrated. Any correction the solver made is automatically
+    // reflected in the resulting motion.
+    for (let i = 0; i < N; i++) {
+      if (invMass[i] === 0) continue;
+      const i3 = i * 3;
+      vel[i3] = (pos[i3] - prev[i3]) / dt;
+      vel[i3 + 1] = (pos[i3 + 1] - prev[i3 + 1]) / dt;
+      vel[i3 + 2] = (pos[i3 + 2] - prev[i3 + 2]) / dt;
+    }
+  }
+}
+
+// ---- rendering ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(1.2, -0.8, 3.0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(1.2, -0.8, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dl = new THREE.DirectionalLight(0xffffff, 1.1);
+dl.position.set(1, 2, 3);
+scene.add(dl);
+
+const geometry = new THREE.BufferGeometry();
+geometry.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+const tri = [];
+for (let r = 0; r < ROWS - 1; r++) {
+  for (let c = 0; c < COLS - 1; c++) {
+    const a = idx(c, r), b = idx(c + 1, r), d = idx(c, r + 1), e = idx(c + 1, r + 1);
+    tri.push(a, d, b, b, d, e);
+  }
+}
+geometry.setIndex(tri);
+
+const material = new THREE.MeshStandardMaterial({
+  color: 0x4e8cff, roughness: 0.75, metalness: 0.0, side: THREE.DoubleSide,
+});
+const mesh = new THREE.Mesh(geometry, material);
+scene.add(mesh);
+
+const dots = new THREE.Points(
+  geometry, new THREE.PointsMaterial({ color: 0xffaa33, size: 0.02 })
+);
+dots.visible = false;
+scene.add(dots);
+
+// ---- ui ----
+const $ = (id) => document.getElementById(id);
+function syncUI() {
+  // compliance spans many orders of magnitude, so the slider is logarithmic:
+  // 0 -> perfectly inextensible, 100 -> very soft
+  compStretch = $("compStretch").value == 0 ? 0 : Math.pow(10, -8 + $("compStretch").value / 12.5);
+  compBend = $("compBend").value == 0 ? 0 : Math.pow(10, -8 + $("compBend").value / 12.5);
+  iterations = Number($("iters").value);
+  windStrength = Number($("wind").value) / 100 * 1.2;
+  $("csv").textContent = compStretch.toExponential(1);
+  $("cbv").textContent = compBend.toExponential(1);
+  $("itv").textContent = iterations;
+  $("wv").textContent = $("wind").value;
+}
+["compStretch", "compBend", "iters", "wind"].forEach((id) =>
+  $(id).addEventListener("input", syncUI));
+syncUI();
+
+addEventListener("keydown", (e) => {
+  if (e.key === "w") material.wireframe = !material.wireframe;
+  if (e.key === "p") dots.visible = !dots.visible;
+  if (e.key === " ") { build(); e.preventDefault(); }
+});
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+build();
+
+let last = performance.now(), frames = 0, fps = 0, acc = 0, solveMs = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  // Clamp dt: a background tab or a stall would otherwise hand the solver a
+  // huge timestep and produce one enormous, ugly jump.
+  const dtFrame = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+
+  const t0 = performance.now();
+  step(dtFrame);
+  solveMs = solveMs * 0.9 + (performance.now() - t0) * 0.1;
+
+  geometry.attributes.position.needsUpdate = true;
+  geometry.computeVertexNormals();   // lighting has to follow the deformation
+
+  frames++; acc += dtFrame;
+  if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
+  $("stats").innerHTML =
+    `${N} particles · ${stretchA.length + bendA.length} constraints<br>` +
+    `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(1)} ms`;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
