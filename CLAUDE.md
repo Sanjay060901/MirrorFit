@@ -20,7 +20,8 @@ target: ~18–24 months to pilot at a part-time solo pace.
   (face-based, but the capture→track→anchor→render→smooth structure is the template)
 
 ## Current stage
-Stage 3 (see OPERATION_PLAN.md). Update this line as stages complete.
+Stage 6.5 — live try-on works end to end (see OPERATION_PLAN.md).
+Update this line as stages complete.
 
 ## How to work with me (IMPORTANT — I am learning this stack)
 - I know Python/FastAPI/AWS/DevOps well. I am LEARNING JS, Three.js, MediaPipe, 3D math.
@@ -46,9 +47,15 @@ Stage 3 (see OPERATION_PLAN.md). Update this line as stages complete.
 - Keep secrets out of the repo; .env is gitignored
 
 ## Repo map
-- web/stage0..stage3/  — learning-stage files (skeletons with TODOs)
+- web/index.html       — dev menu linking every stage
+- web/stage0..stage6/  — one self-contained page per learning stage
+- web/lib/             — shared modules (cloth.js: capsules, drafting, GPU XPBD solver)
+- web/tests/           — headless checks; run before touching capsule/drafting code
 - web/reference/       — known-good reference implementation (do not "improve" it)
-- web/assets/          — garment PNGs, test models
+- web/assets/          — bodytwin.glb, bodyfit.json, garment PNGs
+- scripts/bodytwin/    — Anny -> glTF exporter (regenerates web/assets/bodytwin.glb)
 - backend/             — FastAPI app (Stage 4+)
 - infra/               — CDK app (Stage 4+)
 - docs/                — plan + spec + accuracy notes
+
+The live try-on is web/stage6/tryon-live.html — camera, twin and cloth together.

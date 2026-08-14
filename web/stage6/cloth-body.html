@@ -151,6 +151,21 @@ function percentile(arr, p) {
   return arr[Math.min(arr.length - 1, Math.floor(arr.length * p))];
 }
 
+// Same point-vs-capsule test the shader does, in JS. We need it at BUILD time,
+// not just solve time, to decide which garment particles are being generated
+// inside a limb.
+function insideCapsule(cap, x, y, z, extra) {
+  const abx = cap.b.x - cap.a.x, aby = cap.b.y - cap.a.y, abz = cap.b.z - cap.a.z;
+  const denom = Math.max(abx * abx + aby * aby + abz * abz, 1e-9);
+  const t = THREE.MathUtils.clamp(
+    ((x - cap.a.x) * abx + (y - cap.a.y) * aby + (z - cap.a.z) * abz) / denom, 0, 1);
+  const dx = x - (cap.a.x + abx * t);
+  const dy = y - (cap.a.y + aby * t);
+  const dz = z - (cap.a.z + abz * t);
+  const r = cap.rx + extra;          // arms are measured round, so rx == rz
+  return dx * dx + dy * dy + dz * dz < r * r;
+}
+
 function buildCapsules(skinned) {
   const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
   const wp = (n) => {
@@ -292,6 +307,8 @@ function garmentProfile() {
     cx: (chest.a.x + chest.b.x) / 2,
     cz: (chest.a.z + chest.b.z) / 2,
     yShoulder, yHem, yNeck,
+    armL: named["upperarm01.L->lowerarm01.L"],
+    armR: named["upperarm01.R->lowerarm01.R"],
     // The neck opening must clear the neck's COLLISION radius, not its
     // measured radius. Cutting it to the raw measurement made the hole
     // smaller than the thing it has to fit over, so collision ejected the
@@ -332,6 +349,26 @@ function buildSim() {
   const pos = new Float32Array(N * 4);
   const idx = (c, r) => r * NCOL + ((c % NCOL) + NCOL) % NCOL;   // columns wrap
 
+  // ARMHOLES. A closed tube cannot coexist with arms held near the sides: the
+  // cylinder gets generated straight THROUGH both upper arms, and collision
+  // then ejects the whole garment sideways every frame. No amount of friction
+  // or margin tuning fixes that — it is precisely why real shirts have
+  // armholes cut into them.
+  //
+  // Rather than cut the hole at a guessed angle, cut it where the arm actually
+  // is: any particle generated inside the upper-arm capsule (plus clearance)
+  // is deactivated. The hole is then SHAPED BY THE BODY, and re-shapes itself
+  // automatically when the twin's proportions or arm position change — which
+  // matters for Stage 6.5, where the arms move every frame.
+  //
+  // Only the UPPER arm counts. Forearms and wrists hang beside the hips and
+  // would punch holes through the middle of the shirt.
+  const ARMHOLE_CLEAR = 0.022;
+  const armholeTop = YOKE;                       // never cut the shoulder seam
+  const armholeBot = Math.round(NROW * 0.42);    // finishes around mid-chest
+  const armCaps = [p.armL, p.armR].filter(Boolean);
+  const active = new Uint8Array(N).fill(1);
+
   for (let r = 0; r < NROW; r++) {
     let rx, rz, y;
     if (r < YOKE) {
@@ -357,32 +394,143 @@ function buildSim() {
     for (let c = 0; c < NCOL; c++) {
       const th = (c / NCOL) * Math.PI * 2;
       const i = idx(c, r);
-      pos[i * 4] = p.cx + rx * Math.cos(th);
+      const x = p.cx + rx * Math.cos(th);
+      const z = p.cz + rz * Math.sin(th);
+      pos[i * 4] = x;
       pos[i * 4 + 1] = y;
-      pos[i * 4 + 2] = p.cz + rz * Math.sin(th);
-      pos[i * 4 + 3] = 1;    // nothing pinned; the neck hole holds it up
+      pos[i * 4 + 2] = z;
+
+      const cut = r >= armholeTop && r <= armholeBot &&
+        armCaps.some((cap) => insideCapsule(cap, x, y, z, ARMHOLE_CLEAR));
+      // Inactive particles get w = 0 so predict/collide skip them outright;
+      // they are also excluded from constraints and triangles below, so they
+      // are simply inert entries in the buffer. Keeping them in place (rather
+      // than compacting the array) means idx() stays a plain grid lookup.
+      active[i] = cut ? 0 : 1;
+      pos[i * 4 + 3] = cut ? 0 : 1;   // nothing else is pinned; the neck holds it
     }
   }
 
+  const cutCount = N - active.reduce((s, v) => s + v, 0);
+  console.log(`armholes: ${cutCount} of ${N} body particles removed ` +
+              `(rows ${armholeTop}-${armholeBot} of ${NROW})`);
+
+  // ---- sleeves ----
+  // A sleeveless tube has nothing holding it laterally — it slides and
+  // rotates off the shoulders no matter how much friction we add. Real shirts
+  // are captured by the ARMS passing through sleeves.
+  //
+  // Rather than branch the tube's topology (an armhole cut into a closed
+  // cylinder, which is fiddly to generate and easy to get wrong), the sleeves
+  // are built as separate small tubes around each upper arm and STITCHED to
+  // the body with distance constraints. Physically equivalent capture, far
+  // simpler construction.
+  const SCOL = Math.max(10, Math.round(NCOL * 0.32));
+  const SROW = 6;
+  const sleeves = [];
+  const sleevePos = [];
+
+  for (const arm of [p.armL, p.armR]) {
+    if (!arm) continue;
+    const axis = arm.b.clone().sub(arm.a).normalize();
+    // any vector not parallel to the axis gives us a perpendicular frame
+    const tmp = Math.abs(axis.y) < 0.9
+      ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    const u = new THREE.Vector3().crossVectors(axis, tmp).normalize();
+    const v = new THREE.Vector3().crossVectors(axis, u).normalize();
+    const rad = arm.rx + COLLISION_MARGIN + EASE;
+    const start = 0.02, len = 0.34;    // short sleeve: a third down the arm
+
+    const base = sleevePos.length / 4 + N;
+    for (let r = 0; r < SROW; r++) {
+      const t = start + (r / (SROW - 1)) * len;
+      const centre = arm.a.clone().addScaledVector(arm.b.clone().sub(arm.a), t);
+      for (let c = 0; c < SCOL; c++) {
+        const th = (c / SCOL) * Math.PI * 2;
+        const pt = centre.clone()
+          .addScaledVector(u, rad * Math.cos(th))
+          .addScaledVector(v, rad * Math.sin(th));
+        sleevePos.push(pt.x, pt.y, pt.z, 1);
+      }
+    }
+    sleeves.push({ base, SCOL, SROW });
+  }
+
+  const TOTAL = N + sleevePos.length / 4;
+  const allPos = new Float32Array(TOTAL * 4);
+  allPos.set(pos, 0);
+  allPos.set(sleevePos, N * 4);
+
   const A = [], B = [], rest = [], kind = [];
+  // Sleeve particles live past index N and are always active; body particles
+  // may have been removed to form an armhole. A constraint touching a removed
+  // particle would tether the fabric to a dead point, so it is dropped. One
+  // guard here covers the tube lattice, the bend constraints AND the sleeve
+  // seam below.
+  const isActive = (i) => i >= N || active[i] === 1;
   const add = (a, b, k) => {
+    if (!isActive(a) || !isActive(b)) return;
     A.push(a); B.push(b); kind.push(k);
     rest.push(Math.hypot(
-      pos[a * 4] - pos[b * 4],
-      pos[a * 4 + 1] - pos[b * 4 + 1],
-      pos[a * 4 + 2] - pos[b * 4 + 2]));
+      allPos[a * 4] - allPos[b * 4],
+      allPos[a * 4 + 1] - allPos[b * 4 + 1],
+      allPos[a * 4 + 2] - allPos[b * 4 + 2]));
   };
+
+  // Body tube. The last rows use STRETCH compliance for their bend
+  // constraints instead of bend compliance — a real hem is a folded, doubled
+  // band, noticeably stiffer than the body of the shirt, and that stiffness
+  // is what stops a free edge curling up on itself.
+  const HEM_ROWS = 3;
   for (let r = 0; r < NROW; r++) {
+    const stiffHem = r >= NROW - HEM_ROWS ? 0 : 1;
     for (let c = 0; c < NCOL; c++) {
-      // Around the body — wraps, so there is no seam to split open.
       add(idx(c, r), idx(c + 1, r), 0);
       if (r + 1 < NROW) {
         add(idx(c, r), idx(c, r + 1), 0);
         add(idx(c, r), idx(c + 1, r + 1), 0);
         add(idx(c + 1, r), idx(c, r + 1), 0);
       }
-      add(idx(c, r), idx(c + 2, r), 1);
-      if (r + 2 < NROW) add(idx(c, r), idx(c, r + 2), 1);
+      add(idx(c, r), idx(c + 2, r), stiffHem);
+      if (r + 2 < NROW) add(idx(c, r), idx(c, r + 2), stiffHem);
+    }
+  }
+
+  // Sleeve tubes, same lattice as the body.
+  const sidx = (s, c, r) => s.base + r * s.SCOL + ((c % s.SCOL) + s.SCOL) % s.SCOL;
+  for (const s of sleeves) {
+    for (let r = 0; r < s.SROW; r++) {
+      for (let c = 0; c < s.SCOL; c++) {
+        add(sidx(s, c, r), sidx(s, c + 1, r), 0);
+        if (r + 1 < s.SROW) {
+          add(sidx(s, c, r), sidx(s, c, r + 1), 0);
+          add(sidx(s, c, r), sidx(s, c + 1, r + 1), 0);
+          add(sidx(s, c + 1, r), sidx(s, c, r + 1), 0);
+        }
+        add(sidx(s, c, r), sidx(s, c + 2, r), 1);
+      }
+    }
+
+    // Stitch the sleeve's top ring to whichever body vertices are nearest.
+    // This is the seam: it's what makes the arm carry the shirt.
+    //
+    // Skipping removed particles is what makes the seam land on the ARMHOLE
+    // RIM — the nearest surviving vertex to a point just outside the arm is,
+    // by construction, on the edge of the hole we cut around that arm. So the
+    // sleeve is sewn to the armhole exactly as a real one is, without us
+    // having to trace the rim explicitly.
+    for (let c = 0; c < s.SCOL; c++) {
+      const si = sidx(s, c, 0);
+      let best = -1, bestD = Infinity;
+      for (let bi = 0; bi < N; bi++) {
+        if (!active[bi]) continue;
+        const dx = allPos[si * 4] - allPos[bi * 4];
+        const dy = allPos[si * 4 + 1] - allPos[bi * 4 + 1];
+        const dz = allPos[si * 4 + 2] - allPos[bi * 4 + 2];
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < bestD) { bestD = d; best = bi; }
+      }
+      if (best >= 0) add(si, best, 0);
     }
   }
   const groups = [];
@@ -391,7 +539,7 @@ function buildSim() {
     for (let k = 0; k < A.length; k++) if (kind[k] === wantKind) map.push(k);
     const sa = map.map((k) => A[k]);
     const sb = map.map((k) => B[k]);
-    const { colour, numColours } = greedyColour(sa, sb, N);
+    const { colour, numColours } = greedyColour(sa, sb, TOTAL);
     const order = map.map((_, i) => i).sort((x, y) => colour[x] - colour[y]);
     const ranges = [];
     let start = 0;
@@ -408,7 +556,8 @@ function buildSim() {
       ranges,
     });
   }
-  return { N, pos, groups, idx, NCOL, NROW };
+  return { N: TOTAL, pos: allPos, groups, idx, NCOL, NROW, bodyCount: N,
+           sleeves, active };
 }
 
 function greedyColour(cA, cB, numParticles) {
@@ -817,11 +966,29 @@ function buildRenderMesh() {
   // shirt would render with a slit down one side even though the simulation
   // is closed there.
   const tri = [];
+  // Each quad is emitted as two triangles, and each triangle only if all three
+  // of its corners survived the armhole cut. Testing per TRIANGLE rather than
+  // per quad keeps a diagonal half-quad along the rim, so the hole's edge is
+  // stepped by half a cell instead of a whole one.
+  const act = sim.active;
   for (let r = 0; r < sim.NROW - 1; r++) {
     for (let c = 0; c < sim.NCOL; c++) {
       const a = sim.idx(c, r), b = sim.idx(c + 1, r);
       const d = sim.idx(c, r + 1), e = sim.idx(c + 1, r + 1);
-      tri.push(a, d, b, b, d, e);
+      if (act[a] && act[d] && act[b]) tri.push(a, d, b);
+      if (act[b] && act[d] && act[e]) tri.push(b, d, e);
+    }
+  }
+  // Sleeves are separate tubes in the same buffer, so they need their own
+  // triangles — they share the vertex array but not the body's indexing.
+  for (const s of sim.sleeves) {
+    const si = (c, r) => s.base + r * s.SCOL + ((c % s.SCOL) + s.SCOL) % s.SCOL;
+    for (let r = 0; r < s.SROW - 1; r++) {
+      for (let c = 0; c < s.SCOL; c++) {
+        const a = si(c, r), b = si(c + 1, r);
+        const d = si(c, r + 1), e = si(c + 1, r + 1);
+        tri.push(a, d, b, b, d, e);
+      }
     }
   }
   geometry.setIndex(tri);

@@ -1,0 +1,88 @@
+<!DOCTYPE html><meta charset="utf-8">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}
+</script>
+<body><pre id="o">running…</pre>
+<script type="module">
+// Headless smoke test for the non-GPU half of web/lib/cloth.js: load the real
+// body twin, measure its capsules, draft a shirt around it, and assert the
+// numbers are physically sensible. Runs without WebGPU or a camera.
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { measureCapsules, poseCapsules, draftShirt, buildGarmentGeometry, norm }
+  from "../lib/cloth.js";
+
+const log = [];
+const say = (s) => { log.push(s); document.getElementById("o").textContent = log.join("\n"); };
+
+const SPEC = [
+  { label: "chestUpper", a: "spine01", b: "neck01", owners: ["spine01", "breast"], elliptical: true },
+  { label: "chest", a: "spine03", b: "spine01", owners: ["spine02", "spine03", "breast"], elliptical: true },
+  { label: "waist", a: "spine04", b: "spine03", owners: ["spine03", "spine04"], elliptical: true },
+  { label: "hips", a: ["upperleg01.L", "upperleg01.R"], b: "spine04", owners: ["pelvis", "spine04"], elliptical: true },
+  { label: "shoulderL", a: "clavicle.L", b: "upperarm01.L", owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "shoulderR", a: "clavicle.R", b: "upperarm01.R", owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "armL", a: "upperarm01.L", b: "lowerarm01.L", owners: ["upperarm01.L", "upperarm02.L"], elliptical: false },
+  { label: "armR", a: "upperarm01.R", b: "lowerarm01.R", owners: ["upperarm01.R", "upperarm02.R"], elliptical: false },
+  { label: "forearmL", a: "lowerarm01.L", b: "wrist.L", owners: ["lowerarm01.L", "lowerarm02.L"], elliptical: false },
+  { label: "forearmR", a: "lowerarm01.R", b: "wrist.R", owners: ["lowerarm01.R", "lowerarm02.R"], elliptical: false },
+  { label: "neck", a: "neck01", b: "head", owners: ["neck"], elliptical: false },
+];
+
+try {
+  const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+  let skinned = null;
+  gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+  const root = gltf.scene;
+  root.updateMatrixWorld(true);
+  say(`model loaded: ${skinned.geometry.attributes.position.count} verts, ` +
+      `${skinned.skeleton.bones.length} bones`);
+
+  const caps = measureCapsules(skinned, root, SPEC);
+  say(`capsules measured: ${caps.length}/${SPEC.length}`);
+  for (const c of caps) {
+    const bad = !isFinite(c.rx) || !isFinite(c.rz) || c.rx <= 0 || c.rz <= 0;
+    say(`  ${c.label.padEnd(11)} rx=${c.rx.toFixed(3)} rz=${c.rz.toFixed(3)} ` +
+        `dz=${c.dz.toFixed(3)}${bad ? "   <<< BAD" : ""}`);
+  }
+
+  // Body frame from bone positions, exactly as the live page derives it.
+  const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
+  const P = (n) => root.worldToLocal(byName.get(norm(n)).getWorldPosition(new THREE.Vector3()));
+  const left = P("upperarm01.L").sub(P("upperarm01.R")).normalize();
+  const up = P("upperarm01.L").add(P("upperarm01.R")).multiplyScalar(0.5)
+    .sub(P("upperleg01.L").add(P("upperleg01.R")).multiplyScalar(0.5)).normalize();
+  const front = new THREE.Vector3().crossVectors(left, up).normalize();
+  up.crossVectors(front, left).normalize();
+  say(`frame  left=(${left.toArray().map((v) => v.toFixed(2))}) ` +
+      `up=(${up.toArray().map((v) => v.toFixed(2))}) ` +
+      `front=(${front.toArray().map((v) => v.toFixed(2))})`);
+
+  poseCapsules(caps, root, { left, up, front }, 0);
+
+  for (const ease of [-0.01, 0.03, 0.09]) {
+    const g = draftShirt({ caps, res: 44, ease });
+    let nan = 0;
+    const box = new THREE.Box3();
+    const v = new THREE.Vector3();
+    for (let i = 0; i < g.N; i++) {
+      const x = g.pos[i * 4], y = g.pos[i * 4 + 1], z = g.pos[i * 4 + 2];
+      if (!isFinite(x) || !isFinite(y) || !isFinite(z)) { nan++; continue; }
+      box.expandByPoint(v.set(x, y, z));
+    }
+    const size = box.getSize(new THREE.Vector3());
+    const cut = g.bodyCount - g.active.reduce((s, a) => s + a, 0);
+    const built = buildGarmentGeometry(g);
+    const tris = built.geometry.index.count / 3;
+    say(`ease ${(ease * 1000).toFixed(0).padStart(3)} mm: ${g.N} particles, ` +
+        `${cut} cut, ${tris} tris, ${g.sleeves.length} sleeves, ` +
+        `nan=${nan}, bbox ${size.x.toFixed(2)}x${size.y.toFixed(2)}x${size.z.toFixed(2)} m`);
+    if (nan) say("  <<< NaN IN GARMENT POSITIONS");
+    if (!g.sleeves.length) say("  <<< NO SLEEVES BUILT");
+    if (!cut) say("  <<< NO ARMHOLES CUT");
+  }
+  say("DONE");
+} catch (e) {
+  say("FAILED: " + e.stack);
+}
+</script>

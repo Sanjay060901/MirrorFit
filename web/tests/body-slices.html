@@ -1,0 +1,75 @@
+<!DOCTYPE html><meta charset="utf-8">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}
+</script>
+<body><pre id="o">running…</pre>
+<script type="module">
+// Ground truth for the pelvis: what are the body's ACTUAL half-width and
+// half-depth around the hips, measured straight off the mesh?
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { norm } from "../lib/cloth.js";
+
+const log = [];
+const say = (s) => { log.push(s); document.getElementById("o").textContent = log.join("\n"); };
+
+const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+let sk = null;
+gltf.scene.traverse((o) => { if (o.isSkinnedMesh) sk = o; });
+gltf.scene.updateMatrixWorld(true);
+
+const names = sk.skeleton.bones.map((b) => norm(b.name));
+say("bones containing pelvis/spine/leg:\n  " +
+    names.filter((n) => /pelvis|spine|upperleg01/.test(n)).join(", "));
+
+const byName = new Map(sk.skeleton.bones.map((b) => [norm(b.name), b]));
+const P = (n) => byName.has(norm(n))
+  ? gltf.scene.worldToLocal(byName.get(norm(n)).getWorldPosition(new THREE.Vector3()))
+  : null;
+for (const n of ["pelvis", "spine05", "spine03", "upperleg01.L", "upperleg01.R"]) {
+  const p = P(n);
+  say(`  ${n.padEnd(14)} ${p ? p.toArray().map((v) => v.toFixed(3)).join(", ") : "MISSING"}`);
+}
+
+// dominant bone per vertex
+const si = sk.geometry.attributes.skinIndex, sw = sk.geometry.attributes.skinWeight;
+const owner = new Array(si.count);
+for (let v = 0; v < si.count; v++) {
+  let best = 0, bw = -1;
+  for (let j = 0; j < 4; j++) {
+    const w = sw.getComponent(v, j);
+    if (w > bw) { bw = w; best = si.getComponent(v, j); }
+  }
+  owner[v] = names[best] ?? "";
+}
+
+const pos = sk.geometry.attributes.position;
+const pct = (a, p) => { a.sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(a.length * p))]; };
+
+// Slice the whole body horizontally and report half-width / half-depth at each
+// height, so we can see the real silhouette rather than a capsule's guess.
+const hipY = (P("upperleg01.L").y + P("upperleg01.R").y) / 2;
+const v = new THREE.Vector3();
+say(`\nhip joint height y=${hipY.toFixed(3)}`);
+say("height(m)   halfWidth  halfDepth   centreZ   (10 mm slabs)");
+for (let dy = -0.14; dy <= 0.42; dy += 0.04) {
+  const y0 = hipY + dy;
+  const xs = [], zs = [];
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).applyMatrix4(sk.matrixWorld);
+    gltf.scene.worldToLocal(v);
+    if (Math.abs(v.y - y0) > 0.005) continue;
+    // exclude arms: they hang beside the torso at these heights
+    if (/arm|wrist|hand|metacarpal|finger/.test(owner[i])) continue;
+    if (/upperleg|lowerleg|foot/.test(owner[i]) && dy < 0) continue;
+    xs.push(v.x); zs.push(v.z);
+  }
+  if (xs.length < 12) { say(`${y0.toFixed(3)}    (only ${xs.length} verts)`); continue; }
+  const hw = (pct(xs.slice(), 0.99) - pct(xs.slice(), 0.01)) / 2;
+  const zmax = pct(zs.slice(), 0.99), zmin = pct(zs.slice(), 0.01);
+  say(`y=${y0.toFixed(3)} (${dy >= 0 ? "+" : ""}${dy.toFixed(2)})   ` +
+      `${hw.toFixed(3)}      ${((zmax - zmin) / 2).toFixed(3)}     ` +
+      `${((zmax + zmin) / 2).toFixed(3)}   n=${xs.length}`);
+}
+say("DONE");
+</script>

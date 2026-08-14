@@ -1,0 +1,55 @@
+<!DOCTYPE html><meta charset="utf-8">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}
+</script>
+<body><pre id="o">running…</pre>
+<script type="module">
+// Which bone dominates which vertices, and where those vertices actually sit.
+// Needed to choose sane `owners` lists: a capsule can only be measured from
+// vertices the skinning says belong to it.
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { norm } from "../lib/cloth.js";
+
+const log = [];
+const say = (s) => { log.push(s); document.getElementById("o").textContent = log.join("\n"); };
+
+const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+let sk = null;
+gltf.scene.traverse((o) => { if (o.isSkinnedMesh) sk = o; });
+gltf.scene.updateMatrixWorld(true);
+
+const names = sk.skeleton.bones.map((b) => norm(b.name));
+const si = sk.geometry.attributes.skinIndex, sw = sk.geometry.attributes.skinWeight;
+const pos = sk.geometry.attributes.position;
+const v = new THREE.Vector3();
+
+const groups = new Map();
+for (let i = 0; i < si.count; i++) {
+  let best = 0, bw = -1;
+  for (let j = 0; j < 4; j++) {
+    const w = sw.getComponent(i, j);
+    if (w > bw) { bw = w; best = si.getComponent(i, j); }
+  }
+  const n = names[best] ?? "";
+  v.fromBufferAttribute(pos, i).applyMatrix4(sk.matrixWorld);
+  gltf.scene.worldToLocal(v);
+  if (!groups.has(n)) groups.set(n, { n: 0, ylo: 1e9, yhi: -1e9, xmax: 0, zlo: 1e9, zhi: -1e9 });
+  const g = groups.get(n);
+  g.n++;
+  g.ylo = Math.min(g.ylo, v.y); g.yhi = Math.max(g.yhi, v.y);
+  g.xmax = Math.max(g.xmax, Math.abs(v.x));
+  g.zlo = Math.min(g.zlo, v.z); g.zhi = Math.max(g.zhi, v.z);
+}
+
+say("bone".padEnd(16) + "verts   y range        |x|max   z range");
+const want = /pelvis|spine|breast|neck|clavicle|shoulder|upperleg01/;
+for (const [n, g] of [...groups.entries()].sort((a, b) => a[1].ylo - b[1].ylo)) {
+  if (!want.test(n)) continue;
+  say(`${n.padEnd(16)}${String(g.n).padStart(5)}   ` +
+      `${g.ylo.toFixed(3)}..${g.yhi.toFixed(3)}   ${g.xmax.toFixed(3)}   ` +
+      `${g.zlo.toFixed(3)}..${g.zhi.toFixed(3)}`);
+}
+say("\ntotal distinct dominant bones: " + groups.size);
+say("DONE");
+</script>

@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 6.5 — live t-shirt try-on</title>
+<style>
+  body { margin: 0; background: #0d0d0f; color: #ddd; font-family: system-ui, sans-serif;
+         display: grid; place-items: center; min-height: 100vh; }
+  #stage { position: relative; width: 640px; height: 480px;
+           box-shadow: 0 8px 40px rgba(0,0,0,0.6); border-radius: 6px; overflow: hidden; }
+  #video, #twin, #dots { position: absolute; top: 0; left: 0; width: 640px; height: 480px; }
+  #video { transform: scaleX(-1); }
+  #ui { position: fixed; top: 12px; left: 12px; width: 250px;
+        background: rgba(0,0,0,0.78); padding: 12px 14px; border-radius: 8px;
+        font-size: 12.5px; line-height: 1.75; }
+  #ui label { display: block; }
+  #ui hr { border: none; border-top: 1px solid #2a2a2a; margin: 9px 0; }
+  input[type=range] { width: 120px; vertical-align: middle; }
+  button { background: #234; color: #cde; border: 1px solid #456; border-radius: 4px;
+           padding: 4px 9px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #2c4a5c; }
+  #status { color: #8c8; } #err { color: #f77; }
+  .k { color: #7ab; font-weight: 600; }
+  .muted { color: #888; }
+  .sw { display: inline-block; width: 17px; height: 17px; border-radius: 3px;
+        border: 1px solid #555; cursor: pointer; vertical-align: middle; margin-right: 3px; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div><b>Stage 6.5 — live try-on</b></div>
+  <div id="status">loading…</div>
+  <div id="err"></div>
+  <hr />
+  <div><button id="drape">put the shirt on</button></div>
+  <div class="muted" id="fit">shape: fitting…</div>
+  <hr />
+  <div>colour
+    <span class="sw" data-c="c94f4f" style="background:#c94f4f"></span>
+    <span class="sw" data-c="2f5f8f" style="background:#2f5f8f"></span>
+    <span class="sw" data-c="e8e4dc" style="background:#e8e4dc"></span>
+    <span class="sw" data-c="2b2b30" style="background:#2b2b30"></span>
+    <span class="sw" data-c="4d7a52" style="background:#4d7a52"></span>
+  </div>
+  <label>size (ease) <input id="ease" type="range" min="-30" max="90" value="30" />
+    <span id="easev">+30</span> mm</label>
+  <label>drape <input id="bend" type="range" min="0" max="100" value="45" />
+    <span id="bendv" class="muted"></span></label>
+  <label>grip <input id="fric" type="range" min="0" max="100" value="85" />
+    <span id="fricv">85</span></label>
+  <label>quality <input id="res" type="range" min="32" max="72" value="44" step="4" />
+    <span id="resv">44</span></label>
+  <hr />
+  <label>body <select id="bodymode">
+    <option value="occlude" selected>hidden (occludes)</option>
+    <option value="ghost">ghost</option>
+    <option value="solid">solid</option>
+    <option value="off">off</option>
+  </select></label>
+  <label>video <input id="vop" type="range" min="0" max="100" value="100" /></label>
+  <div><span class="k">space</span> re-drape · <span class="k">d</span> dots ·
+       <span class="k">w</span> wireframe</div>
+</div>
+
+<div id="stage">
+  <video id="video" autoplay playsinline muted width="640" height="480"></video>
+  <canvas id="twin" width="640" height="480"></canvas>
+  <canvas id="dots" width="640" height="480"></canvas>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import {
+  createDevice, measureCapsules, poseCapsules, draftShirt,
+  GarmentSim, buildGarmentGeometry, norm,
+} from "../lib/cloth.js";
+
+// ============================================================================
+// Stage 6.5 — the whole pipeline, live
+//
+// Everything built separately so far, running at once:
+//
+//   camera ─► MediaPipe Pose ─► One-Euro filter ─► retarget the body twin
+//                                                        │
+//                                    capsules follow the posed skeleton
+//                                                        │
+//                                       GPU XPBD cloth solves against them
+//                                                        │
+//                                    garment composited over the video
+//
+// THE ONE IDEA THAT MAKES THIS WORK: everything lives in the twin's own MODEL
+// SPACE — metres, y-up, hips at the origin, and NOT mirrored. The mirror (a
+// negative x scale) and the metres-to-pixels scale are applied once, by the
+// parent group, at render time.
+//
+// That is not a tidiness preference. A negative-determinant matrix has no
+// clean rotation/scale decomposition, so anything that asks for a world
+// QUATERNION under the mirror gets a wrong answer — which is what produced the
+// inverted-wrist bug in Stage 5.3. Positions transform through it perfectly
+// well. So: simulate in model space using positions only, mirror at the end.
+//
+// WHAT THIS HONESTLY IS NOT:
+//  - It does not remove the clothes you are already wearing. That is diminished
+//    reality (segment + inpaint the background behind you), a separate and much
+//    harder problem, and no phone-tier system does it convincingly.
+//  - It is not 360°. One webcam cannot see your back; MediaPipe infers occluded
+//    joints and its front/back depth is its weakest output. Turn past ~60° and
+//    the pose degrades. The kiosk phase adds a depth camera for this.
+//  - The garment is PROCEDURAL, drafted from your measurements. It behaves
+//    correctly — that is real cloth physics — but it is not a photographed
+//    product. Stage 7's pattern-graded assets are what make it look like a
+//    specific real shirt.
+// ============================================================================
+
+const video = document.getElementById("video");
+const statusEl = document.getElementById("status");
+const errEl = document.getElementById("err");
+const W = 640, H = 480;
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// camera + pose model  (unchanged from Stage 5.3)
+// ---------------------------------------------------------------------------
+
+async function startCamera() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  // Laptops with Windows Hello expose an infrared camera alongside the colour
+  // one; picking it gives a black, useless feed.
+  const rgb = cams.find((d) => !/ir|infrared/i.test(d.label)) ?? cams[0];
+
+  // `ideal` rather than exact: demanding an exact resolution from a specific
+  // device throws OverconstrainedError on cameras that lack that mode.
+  const attempts = [];
+  if (rgb) attempts.push({ deviceId: { exact: rgb.deviceId },
+                           width: { ideal: W }, height: { ideal: H } });
+  attempts.push({ width: { ideal: W }, height: { ideal: H }, facingMode: "user" });
+  attempts.push(true);
+
+  let stream = null, lastErr = null;
+  for (const c of attempts) {
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: c, audio: false }); break; }
+    catch (e) { lastErr = e; }
+  }
+  if (!stream) throw lastErr;
+  video.srcObject = stream;
+  await new Promise((r) => { video.onloadedmetadata = r; });
+}
+
+let landmarker;
+async function loadLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    // Silhouette widths are the only measurements that observe GIRTH, and
+    // unlike anything derived from worldLandmarks they live in the image plane
+    // rather than depending on MediaPipe's weak depth estimate.
+    outputSegmentationMasks: true,
+    minPoseDetectionConfidence: 0.3,
+    minPosePresenceConfidence: 0.3,
+    minTrackingConfidence: 0.3,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// scene — pixel-perfect camera, so 1 world unit == 1 screen pixel at z = 0
+// ---------------------------------------------------------------------------
+
+const scene = new THREE.Scene();
+const FOV = 60;
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 1, 5000);
+camera.position.z = H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+
+const renderer = new THREE.WebGLRenderer({
+  canvas: $("twin"), alpha: true, antialias: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+const key = new THREE.DirectionalLight(0xffffff, 1.05);
+key.position.set(0.4, 1.6, 2.4);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x88aaff, 0.35);
+rim.position.set(-1.5, 0.6, -1.4);
+scene.add(rim);
+
+// alignGroup owns placement/scale/mirror; twinModel sits inside it with the
+// hips at the origin. Keeping those concerns separate means retargeting never
+// has to know about screen space, and alignment never has to know about bones.
+const alignGroup = new THREE.Group();
+scene.add(alignGroup);
+
+let skinned = null, twinModel = null, bodyMat = null;
+let twinTorsoMetres = 0;
+const boneByName = new Map();
+const restDirs = new Map();
+const plan = [];
+
+const DRIVEN = [
+  ["upperarm01.L", "lowerarm01.L", 11, 13],
+  ["lowerarm01.L", "wrist.L",      13, 15],
+  ["upperarm01.R", "lowerarm01.R", 12, 14],
+  ["lowerarm01.R", "wrist.R",      14, 16],
+  ["upperleg01.L", "lowerleg01.L", 23, 25],
+  ["lowerleg01.L", "foot.L",       25, 27],
+  ["upperleg01.R", "lowerleg01.R", 24, 26],
+  ["lowerleg01.R", "foot.R",       26, 28],
+  // Hand direction is independent of the forearm's, so orienting it recovers
+  // the roll a single forearm vector could never determine.
+  ["wrist.L", "metacarpal1.L", 15, 19],
+  ["wrist.R", "metacarpal1.R", 16, 20],
+];
+
+// Collision proxy. No LEG capsules: a t-shirt's hem stops above the hip, so
+// they would only cost shader time. Every capsule here is 11 more distance
+// tests per particle per iteration per substep — on integrated graphics that
+// is the single biggest lever on frame rate.
+const CAPSULE_SPEC = [
+  { label: "chestUpper", a: "spine01", b: "neck01",
+    owners: ["spine01", "breast"], elliptical: true },
+  { label: "chest", a: "spine03", b: "spine01",
+    owners: ["spine02", "spine03", "breast"], elliptical: true },
+  { label: "waist", a: "spine04", b: "spine03",
+    owners: ["spine03", "spine04"], elliptical: true },
+  // Two things were wrong with the obvious "hip joint to hip joint" capsule.
+  //
+  // It ran HORIZONTALLY, so rx/rz — which assume a vertical capsule — measured
+  // the pelvis's vertical extent instead of its width and depth, giving a blob
+  // 0.246 m across on a body that is 0.146 m across. Hence the midpoint
+  // endpoint, which makes the capsule vertical like every other one.
+  //
+  // And the owners were wrong. Checked against the mesh, spine05 dominates only
+  // the inner crotch region (|x| <= 0.057) — measuring the hips from it
+  // reported a 0.052 m half-width. The hip flare belongs to pelvisL/R and
+  // spine04, which reach |x| = 0.150.
+  { label: "hips", a: ["upperleg01.L", "upperleg01.R"], b: "spine04",
+    owners: ["pelvis", "spine04"], elliptical: true },
+  { label: "shoulderL", a: "clavicle.L", b: "upperarm01.L",
+    owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "shoulderR", a: "clavicle.R", b: "upperarm01.R",
+    owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "armL", a: "upperarm01.L", b: "lowerarm01.L",
+    owners: ["upperarm01.L", "upperarm02.L"], elliptical: false },
+  { label: "armR", a: "upperarm01.R", b: "lowerarm01.R",
+    owners: ["upperarm01.R", "upperarm02.R"], elliptical: false },
+  { label: "forearmL", a: "lowerarm01.L", b: "wrist.L",
+    owners: ["lowerarm01.L", "lowerarm02.L"], elliptical: false },
+  { label: "forearmR", a: "lowerarm01.R", b: "wrist.R",
+    owners: ["lowerarm01.R", "lowerarm02.R"], elliptical: false },
+  // owners is "neck" only: including "head" measures the skull as neck girth
+  // and produces an 11 cm radius, which no shirt can pass over.
+  { label: "neck", a: "neck01", b: "head", owners: ["neck"], elliptical: false },
+];
+
+let capsules = [];
+
+// ---------------------------------------------------------------------------
+// load the twin
+// ---------------------------------------------------------------------------
+
+new GLTFLoader().load("../assets/bodytwin.glb", (gltf) => {
+  gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+  if (!skinned) { errEl.textContent = "no SkinnedMesh in bodytwin.glb"; return; }
+
+  bodyMat = new THREE.MeshStandardMaterial({
+    color: 0x8fb8d8, roughness: 0.75, transparent: true, opacity: 0.35,
+    // The mirroring negative x scale inverts triangle winding; without
+    // DoubleSide the body would be backface-culled into invisibility.
+    side: THREE.DoubleSide,
+  });
+  skinned.material = bodyMat;
+  // Three.js derives the bounding volume from the REST pose and frustum-culls
+  // against it; once retargeting moves vertices outside it the mesh silently
+  // vanishes. The classic SkinnedMesh disappearing act.
+  skinned.frustumCulled = false;
+
+  twinModel = gltf.scene;
+  alignGroup.add(twinModel);
+  twinModel.updateMatrixWorld(true);
+
+  const restWorld = new Map();
+  for (const b of skinned.skeleton.bones) {
+    // GLTFLoader runs node names through PropertyBinding.sanitizeNodeName,
+    // which strips characters reserved for animation paths — including '.'.
+    // Anny's "upperarm01.L" therefore arrives as "upperarm01L".
+    boneByName.set(norm(b.name), b);
+    restWorld.set(b, b.getWorldPosition(new THREE.Vector3()));
+  }
+
+  const boneOf = (n) => boneByName.get(norm(n));
+  const mid = (a, b) => restWorld.get(boneOf(a)).clone()
+    .add(restWorld.get(boneOf(b))).multiplyScalar(0.5);
+  const shoulderMid = mid("upperarm01.L", "upperarm01.R");
+  const hipMid = mid("upperleg01.L", "upperleg01.R");
+
+  // Torso is a better yardstick than full height because feet and head are
+  // often out of frame or poorly tracked.
+  twinTorsoMetres = shoulderMid.distanceTo(hipMid);
+  twinModel.position.sub(hipMid);      // hips at the group origin
+
+  // Seed a plausible scale BEFORE the first detection. 1 unit == 1 pixel here,
+  // so the default scale of 1 would render a 1.6 m model about 1.6 pixels tall.
+  const seed = (H * 0.25) / twinTorsoMetres;
+  alignGroup.scale.set(-seed, seed, seed);
+
+  for (const [boneName, endName, a, b] of DRIVEN) {
+    const bone = boneOf(boneName), end = boneOf(endName);
+    if (!bone || !end) { console.warn("missing bone", boneName, endName); continue; }
+    const dir = restWorld.get(end).clone().sub(restWorld.get(bone));
+    if (dir.lengthSq() < 1e-12) continue;
+    restDirs.set(bone, dir.clone().normalize());
+    plan.push({ bone, a, b, restLen: dir.length(), endBone: end });
+  }
+
+  twinModel.updateMatrixWorld(true);
+  capsules = measureCapsules(skinned, twinModel, CAPSULE_SPEC);
+  ready.twin = true;
+  boot();
+}, undefined, (e) => {
+  errEl.textContent = "bodytwin.glb missing — run scripts/bodytwin/export_anny_gltf.py";
+  console.error(e);
+});
+
+// ---------------------------------------------------------------------------
+// shape fitting (Stage 5.4, condensed)
+// ---------------------------------------------------------------------------
+// Ridge-regularised least squares on measurement RATIOS. Ratios, not absolute
+// lengths, because MediaPipe's landmark 11 sits on the body SURFACE near the
+// acromion while Anny's upperarm01.L is the joint CENTRE inside the body —
+// every absolute measurement carries that systematic offset, and fitting them
+// directly made the solver blame body shape and pin every parameter at its
+// clamp. Dividing through by torso length cancels it.
+
+let fitData = null, fitApplied = false;
+const measureSamples = [];
+const FIT_FRAMES = 45;
+const RIDGE = 0.0003;
+// muscle is excluded: in Anny it changes limb definition rather than girth, so
+// it moves every measurement we can take by 1-2 mm and noise would pick it.
+const SOLVE_PARAMS = ["gender", "weight", "height", "proportions"];
+const MEASURE_DEPS = {
+  shoulder_width: [11, 12], hip_width: [23, 24], upper_arm: [11, 13],
+  forearm: [13, 15], thigh: [23, 25], shin: [25, 27], torso: [11, 12, 23, 24],
+};
+const VIS_MIN = 0.7, MAX_Z_FRACTION = 0.5;
+
+fetch("../assets/bodyfit.json").then((r) => r.json()).then((d) => { fitData = d; })
+  .catch(() => console.warn("bodyfit.json missing — shape fitting disabled"));
+
+const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
+const midOf = (p, q) => ({ x: (p.x + q.x) / 2, y: (p.y + q.y) / 2, z: (p.z + q.z) / 2 });
+
+// A limb pointing toward or away from the camera is FORESHORTENED, and depth
+// is MediaPipe's least reliable output — so its measured 3D length comes back
+// too short. With hands on hips the arms once measured 22% short, which
+// dragged the height fit to its clamp.
+function wellPosed(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+  const len = Math.hypot(dx, dy, dz);
+  return len > 1e-4 && Math.abs(dz) / len <= MAX_Z_FRACTION;
+}
+
+// Torso widths from the segmentation mask. The arms problem: at chest height,
+// arms hanging beside the body sit on the same scanline, so a plain min/max
+// would measure "torso + both arms". Walking OUTWARD from the centreline and
+// stopping at the first background pixel returns the contiguous body run and
+// naturally excludes an arm separated by a gap.
+function measureSilhouette(mask, imageLms, torsoMetres) {
+  if (!mask || !fitData?.silhouetteLevels) return {};
+  const w = mask.width, h = mask.height;
+  const probs = mask.getAsFloat32Array();
+  if (!probs || probs.length < w * h) return {};
+
+  const sx = ((imageLms[11].x + imageLms[12].x) / 2) * w;
+  const sy = ((imageLms[11].y + imageLms[12].y) / 2) * h;
+  const hx = ((imageLms[23].x + imageLms[24].x) / 2) * w;
+  const hy = ((imageLms[23].y + imageLms[24].y) / 2) * h;
+  const torsoPx = Math.hypot(hx - sx, hy - sy);
+  if (torsoPx < 8) return {};
+
+  const out = {};
+  for (const [label, t] of Object.entries(fitData.silhouetteLevels)) {
+    const row = Math.round(sy + t * (hy - sy));
+    const cx = Math.round(sx + t * (hx - sx));
+    if (row < 0 || row >= h || cx < 1 || cx >= w - 1) continue;
+    if (probs[row * w + cx] < 0.5) continue;      // centre must be on the body
+    let L = cx, R = cx;
+    while (L > 0 && probs[row * w + L - 1] >= 0.5) L--;
+    while (R < w - 1 && probs[row * w + R + 1] >= 0.5) R++;
+    // Touching a frame edge means the body is cut off: a lower bound, not a
+    // measurement.
+    if (L === 0 || R === w - 1) continue;
+    out[`width_${label}`] = ((R - L) / torsoPx) * torsoMetres;
+  }
+  return out;
+}
+
+function measurePerson(w, raw) {
+  const vis = (i) => (raw?.[i]?.visibility ?? 1);
+  const ok = (name) => {
+    const deps = MEASURE_DEPS[name];
+    if (!deps.every((i) => vis(i) >= VIS_MIN)) return false;
+    return deps.length === 2 ? wellPosed(w[deps[0]], w[deps[1]]) : true;
+  };
+  const val = {
+    shoulder_width: dist(w[11], w[12]), hip_width: dist(w[23], w[24]),
+    upper_arm: dist(w[11], w[13]), forearm: dist(w[13], w[15]),
+    thigh: dist(w[23], w[25]), shin: dist(w[25], w[27]),
+    torso: dist(midOf(w[11], w[12]), midOf(w[23], w[24])),
+  };
+  // null marks "not measurable this frame" rather than silently passing a
+  // fabricated number into the solve.
+  const out = {};
+  for (const k of Object.keys(val)) out[k] = ok(k) ? val[k] : null;
+  return out;
+}
+
+// Gaussian elimination with partial pivoting; n is at most 5.
+function solveLin(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    if (Math.abs(M[piv][c]) < 1e-12) return null;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  // Divide by the PIVOT M[i][i] — row[i] is already a number, so indexing it
+  // again yields undefined and poisons everything downstream with NaN.
+  return M.map((row, i) => row[n] / M[i][i]);
+}
+
+function fitShape() {
+  const params = SOLVE_PARAMS.filter((p) => fitData.params.includes(p));
+  const REF = "torso";
+  const avgAbs = {}, seen = {};
+  for (const m of fitData.measurements) {
+    const vals = measureSamples.map((x) => x[m]).filter((v) => v != null);
+    seen[m] = vals.length / measureSamples.length;
+    avgAbs[m] = vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
+  }
+  if (avgAbs[REF] == null || seen[REF] < 0.5) { $("fit").textContent = "torso not visible"; return; }
+
+  const meas = fitData.measurements.filter(
+    (m) => m !== REF && avgAbs[m] != null && seen[m] >= 0.5);
+  // With few measurements the solve turns arbitrary; better to keep the
+  // neutral body and say so than to invent a shape from two numbers.
+  if (meas.length < 3) {
+    $("fit").textContent = `only ${meas.length} usable measurements — step back`;
+    return;
+  }
+
+  const avg = {}, baseNorm = {}, jNorm = {};
+  const baseRef = fitData.base[REF];
+  for (const m of meas) { avg[m] = avgAbs[m] / avgAbs[REF]; baseNorm[m] = fitData.base[m] / baseRef; }
+  for (const p of params) {
+    const jRef = fitData.jacobian[p][REF];
+    jNorm[p] = {};
+    // The reference length moves too, which is exactly why this cannot be a
+    // scale factor applied afterwards.
+    for (const m of meas) {
+      jNorm[p][m] = (fitData.base[m] + fitData.jacobian[p][m]) / (baseRef + jRef) - baseNorm[m];
+    }
+  }
+
+  // Drop parameters the SURVIVING measurements cannot see. `height` gets most
+  // of its signal from thigh and shin, so with the legs out of frame it is
+  // nearly invisible — and solving for it anyway is how it ended up pinned
+  // at -1.00.
+  const diag = params.map((p) => meas.reduce((s, m) => s + jNorm[p][m] ** 2, 0));
+  const strongest = Math.max(...diag);
+  const keep = params.filter((_, i) => diag[i] >= strongest * 0.02);
+  if (!keep.length) { $("fit").textContent = "no observable shape params"; return; }
+  params.length = 0; params.push(...keep);
+
+  const d = meas.map((m) => avg[m] - baseNorm[m]);
+  const J = meas.map((m) => params.map((p) => jNorm[p][m]));
+  const n = params.length;
+  const A = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) =>
+    J.reduce((s, row) => s + row[i] * row[j], 0) + (i === j ? RIDGE : 0)));
+  const rhs = Array.from({ length: n }, (_, i) => J.reduce((s, row, k) => s + row[i] * d[k], 0));
+
+  const w = solveLin(A, rhs);
+  if (!w) { console.warn("shape fit singular — keeping neutral body"); return; }
+  // NaN written into bone positions or morph influences corrupts the mesh
+  // permanently; the failure then looks like "the twin disappeared".
+  if (!w.every(Number.isFinite)) { $("fit").textContent = "fit failed (non-finite)"; return; }
+
+  applyShape(params, w.map((v) => THREE.MathUtils.clamp(v, -1, 1)));
+}
+
+function applyShape(params, w) {
+  const dict = skinned.morphTargetDictionary;
+  if (dict && skinned.morphTargetInfluences) {
+    params.forEach((p, i) => {
+      const idx = dict[p];
+      if (idx !== undefined) skinned.morphTargetInfluences[idx] = w[i];
+    });
+  }
+  // Morph targets only move mesh vertices, so without this the skin would
+  // stretch while the skeleton kept the default body's proportions.
+  if (fitData.boneDeltas && fitData.boneNames) {
+    const idxOf = new Map(fitData.boneNames.map((n, i) => [norm(n), i]));
+    for (const bone of skinned.skeleton.bones) {
+      const i = idxOf.get(norm(bone.name));
+      if (i === undefined) continue;
+      let dx = 0, dy = 0, dz = 0;
+      // Bone translations are LOCAL but the deltas are in model space, so a
+      // child's local offset changes by (its own delta minus its parent's).
+      params.forEach((p, k) => {
+        const dl = fitData.boneDeltas[p]?.[i];
+        if (dl) { dx += dl[0] * w[k]; dy += dl[1] * w[k]; dz += dl[2] * w[k]; }
+      });
+      const pi = bone.parent?.isBone ? idxOf.get(norm(bone.parent.name)) : undefined;
+      if (pi !== undefined) {
+        params.forEach((p, k) => {
+          const pd = fitData.boneDeltas[p]?.[pi];
+          if (pd) { dx -= pd[0] * w[k]; dy -= pd[1] * w[k]; dz -= pd[2] * w[k]; }
+        });
+      }
+      bone.position.x += dx; bone.position.y += dy; bone.position.z += dz;
+    }
+    refreshRest();
+    recentreHips();
+    // The shape fit just changed the body's girth, and the capsule radii were
+    // measured from the OLD mesh. Re-measure, or the shirt is drafted to
+    // someone else's chest.
+    twinModel.updateMatrixWorld(true);
+    capsules = measureCapsules(skinned, twinModel, CAPSULE_SPEC);
+  }
+  fitApplied = true;
+  $("fit").textContent = params.map((p, i) => `${p} ${w[i].toFixed(2)}`).join(" · ");
+  console.log("shape fit:", $("fit").textContent);
+}
+
+function recentreHips() {
+  const L = boneByName.get(norm("upperleg01.L")), R = boneByName.get(norm("upperleg01.R"));
+  const SL = boneByName.get(norm("upperarm01.L")), SR = boneByName.get(norm("upperarm01.R"));
+  if (!L || !R || !twinModel) return;
+  alignGroup.updateMatrixWorld(true);
+  const a = L.getWorldPosition(new THREE.Vector3());
+  const b = R.getWorldPosition(new THREE.Vector3());
+  // The alignment scale is torsoPixels / twinTorsoMetres, and shape fitting
+  // just CHANGED the model's torso length — a stale divisor renders the twin
+  // at the wrong size.
+  if (SL && SR) {
+    const s = Math.abs(alignGroup.scale.y) || 1;
+    const shMid = SL.getWorldPosition(new THREE.Vector3())
+      .add(SR.getWorldPosition(new THREE.Vector3())).multiplyScalar(0.5);
+    const t = shMid.distanceTo(a.clone().add(b).multiplyScalar(0.5)) / s;
+    if (t > 1e-4) twinTorsoMetres = t;
+  }
+  // Moving the joints also moved the hips off the group origin, and
+  // alignGroup.position assumes "origin == hips".
+  const hipMid = a.add(b).multiplyScalar(0.5);
+  alignGroup.worldToLocal(hipMid);
+  twinModel.position.sub(hipMid);
+  alignGroup.updateMatrixWorld(true);
+}
+
+function refreshRest() {
+  skinned.skeleton.bones.forEach((b) => { b.quaternion.identity(); b.scale.setScalar(1); });
+  alignGroup.updateMatrixWorld(true);
+  const world = new Map();
+  for (const b of skinned.skeleton.bones) world.set(b, b.getWorldPosition(new THREE.Vector3()));
+  for (const item of plan) {
+    const dir = world.get(item.endBone).clone().sub(world.get(item.bone));
+    if (dir.lengthSq() < 1e-12) continue;
+    item.restLen = dir.length();
+    restDirs.set(item.bone, dir.normalize());
+  }
+  lenRatio.clear();
+}
+
+// ---------------------------------------------------------------------------
+// One-Euro smoothing — filter the INPUT landmarks, not the output rotations
+// ---------------------------------------------------------------------------
+// Filtering quaternions is fiddlier and filtering Euler angles breaks at the
+// ±180° wraparound. Small positional jitter also becomes very visible angular
+// jitter once you take the direction between two nearby joints.
+
+function smoothingFactor(dt, cutoff) { const r = 2 * Math.PI * cutoff * dt; return r / (r + 1); }
+class LowPassFilter {
+  filter(v, a) { this.y = this.init ? a * v + (1 - a) * this.y : v; this.init = true; return this.y; }
+}
+class OneEuroFilter {
+  constructor({ minCutoff = 1.0, beta = 0.3, dCutoff = 1.0 } = {}) {
+    Object.assign(this, { minCutoff, beta, dCutoff });
+    this.xf = new LowPassFilter(); this.df = new LowPassFilter();
+    this.last = null; this.lastT = null;
+  }
+  filter(v, t) {
+    if (this.lastT === null) { this.lastT = t; this.last = v; return this.xf.filter(v, 1); }
+    const dt = Math.max((t - this.lastT) / 1000, 1 / 240);
+    this.lastT = t;
+    const dv = (v - this.last) / dt; this.last = v;
+    const edv = this.df.filter(dv, smoothingFactor(dt, this.dCutoff));
+    return this.xf.filter(v, smoothingFactor(dt, this.minCutoff + this.beta * Math.abs(edv)));
+  }
+}
+
+const USED = [11, 12, 13, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 28];
+const worldFilters = new Map(), imageFilters = new Map();
+for (const i of USED) {
+  worldFilters.set(i, [0, 0, 0].map(() => new OneEuroFilter()));
+  // Image landmarks are normalised 0..1, a much smaller numeric range than
+  // metres, so beta has to be smaller or the filter barely engages.
+  imageFilters.set(i, [0, 0, 0].map(() => new OneEuroFilter({ beta: 0.02 })));
+}
+function smoothLandmarks(lms, filters, t) {
+  const out = {};
+  for (const i of USED) {
+    const f = filters.get(i), lm = lms[i];
+    out[i] = { x: f[0].filter(lm.x, t), y: f[1].filter(lm.y, t), z: f[2].filter(lm.z ?? 0, t) };
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// retargeting
+// ---------------------------------------------------------------------------
+
+const _t = new THREE.Vector3(), _pq = new THREE.Quaternion(), _q = new THREE.Quaternion();
+const _a = new THREE.Vector3(), _b = new THREE.Vector3();
+
+// MediaPipe world landmarks are y-down and z-toward-camera; Three.js is y-up.
+//
+// Note what is NOT done: x is not negated. Mirroring the pose DATA caused the
+// twisted-wrist bug — a mirror image is a REFLECTION, and setFromUnitVectors
+// below can only produce a ROTATION. No rotation turns a left arm into a right
+// arm, so the limb pointed roughly right while its roll came out inverted.
+// Pose anatomically; mirror the whole object at render time.
+function toScene(lm, out) { return out.set(lm.x, -lm.y, -lm.z); }
+
+// Parent rotation in MODEL space, composed from local bone quaternions.
+// NOT bone.parent.getWorldQuaternion(): that runs through alignGroup's
+// negative x scale, and a negative-determinant matrix has no clean
+// translation/rotation/positive-scale decomposition.
+function parentModelQuat(bone, out) {
+  out.identity();
+  const chain = [];
+  for (let p = bone.parent; p && p.isBone; p = p.parent) chain.push(p);
+  for (let i = chain.length - 1; i >= 0; i--) out.multiply(chain[i].quaternion);
+  return out;
+}
+function ancestorScale(bone) {
+  let s = 1;
+  for (let p = bone.parent; p && p.isBone; p = p.parent) s *= p.scale.x || 1;
+  return s;
+}
+
+// Limb length is a property of the person and shouldn't flicker frame to
+// frame, so it gets heavy smoothing while rotation stays responsive.
+const lenRatio = new Map();
+const LEN_SMOOTH = 0.02;
+
+const _left = new THREE.Vector3(), _up = new THREE.Vector3(), _front = new THREE.Vector3();
+const _shMid = new THREE.Vector3(), _hpMid = new THREE.Vector3();
+const _basis = new THREE.Matrix4(), _rootQ = new THREE.Quaternion();
+const _l1 = new THREE.Vector3(), _l2 = new THREE.Vector3();
+
+// Three landmarks give a full body frame: the shoulder line is one axis,
+// hips→shoulders another, and their cross product is which way you face.
+// Rotating the skeleton root by that frame is what lets the twin turn with you
+// instead of permanently facing the camera.
+//
+// Rest frame of our converted model: +x = the body's LEFT, +y = up,
+// +z = front (verified against Anny's toe-vs-ankle offsets).
+function orientTorso(worldLms, rootBone) {
+  toScene(worldLms[11], _l1); toScene(worldLms[12], _l2);
+  _left.subVectors(_l1, _l2);
+  if (_left.lengthSq() < 1e-8) return;
+  _left.normalize();
+  _shMid.addVectors(_l1, _l2).multiplyScalar(0.5);
+
+  toScene(worldLms[23], _l1); toScene(worldLms[24], _l2);
+  _hpMid.addVectors(_l1, _l2).multiplyScalar(0.5);
+  _up.subVectors(_shMid, _hpMid);
+  if (_up.lengthSq() < 1e-8) return;
+  _up.normalize();
+
+  // left × up = front in a right-handed frame; re-derive up afterwards so the
+  // basis is orthonormal even when the shoulder and spine axes aren't exactly
+  // perpendicular (on a real body they rarely are).
+  _front.crossVectors(_left, _up).normalize();
+  _up.crossVectors(_front, _left).normalize();
+  _basis.makeBasis(_left, _up, _front);
+  _rootQ.setFromRotationMatrix(_basis);
+  rootBone.quaternion.slerp(_rootQ, 0.5);   // slerp, never lerp, for rotations
+}
+
+const RETARGET_VIS_MIN = 0.5;
+
+function retarget(worldLms, raw) {
+  // Root first: limb targets are converted through parentModelQuat, which
+  // walks up through the root, so torso orientation must be final before any
+  // limb is solved.
+  const root = skinned?.skeleton?.bones?.[0];
+  if (root) orientTorso(worldLms, root);
+  const vis = (i) => (raw?.[i]?.visibility ?? 1);
+
+  for (const { bone, a, b, restLen } of plan) {
+    // Hold the last good pose for bones whose landmarks the model isn't
+    // confident about. Driving a bone from a guessed landmark produces a wild
+    // rotation that reads as the limb spasming — worse than it not moving.
+    if (vis(a) < RETARGET_VIS_MIN || vis(b) < RETARGET_VIS_MIN) continue;
+    toScene(worldLms[a], _a); toScene(worldLms[b], _b);
+    _t.subVectors(_b, _a);
+    const measured = _t.length();
+    if (measured < 1e-4) continue;
+    _t.divideScalar(measured);
+
+    // DRIVEN is ordered parent-before-child, so a child's parent local
+    // quaternion is already final for this frame.
+    parentModelQuat(bone, _pq);
+    _t.applyQuaternion(_pq.invert());
+    _q.setFromUnitVectors(restDirs.get(bone), _t);
+    bone.quaternion.copy(_q);
+
+    // Stretch the bone so its segment matches the wearer's. Clamped because a
+    // badly-tracked frame would otherwise produce a grotesque limb.
+    const rawRatio = THREE.MathUtils.clamp(measured / restLen, 0.6, 1.6);
+    const prev = lenRatio.get(bone);
+    const s = prev === undefined ? rawRatio : prev + (rawRatio - prev) * LEN_SMOOTH;
+    lenRatio.set(bone, s);
+    // Children inherit this scale, so divide out the ACCUMULATED ancestor
+    // scale to stop ratios compounding — not the immediate parent's, since
+    // above lowerarm01 sits the undriven twist bone upperarm02.
+    bone.scale.setScalar(s / ancestorScale(bone));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// screen alignment (image landmarks — these ARE camera-relative, which is
+// exactly what overlaying needs; worldLandmarks would give metres-from-hip
+// with no idea where you are in frame)
+// ---------------------------------------------------------------------------
+
+const SMOOTH = 0.6;
+let smoothScale = 0, smoothX = 0, smoothY = 0, haveAlign = false;
+const _p1 = new THREE.Vector3(), _p2 = new THREE.Vector3();
+const _sh = new THREE.Vector3(), _hp = new THREE.Vector3();
+
+// Mirrored to match the CSS-flipped video, then into pixel-world coords.
+function pix(lm, out) { return out.set((0.5 - lm.x) * W, -(lm.y - 0.5) * H, 0); }
+
+function align(lms) {
+  if (!twinTorsoMetres) return;
+  _sh.copy(pix(lms[11], _p1)).add(pix(lms[12], _p2)).multiplyScalar(0.5);
+  _hp.copy(pix(lms[23], _p1)).add(pix(lms[24], _p2)).multiplyScalar(0.5);
+  const torsoPx = _sh.distanceTo(_hp);
+  if (torsoPx < 1) return;
+  const scale = torsoPx / twinTorsoMetres;   // metres → pixels, here and now
+
+  if (!haveAlign) { smoothScale = scale; smoothX = _hp.x; smoothY = _hp.y; haveAlign = true; }
+  else {
+    smoothScale += (scale - smoothScale) * SMOOTH;
+    smoothX += (_hp.x - smoothX) * SMOOTH;
+    smoothY += (_hp.y - smoothY) * SMOOTH;
+  }
+  alignGroup.position.set(smoothX, smoothY, 0);
+  // Negative x: mirror the whole twin so it reads like a mirror against the
+  // CSS-flipped video, while the bones underneath stay anatomically correct.
+  // Roll is NOT applied here — orientTorso already contains lean, and applying
+  // a screen-space roll on top would double-count it.
+  alignGroup.scale.set(-smoothScale, smoothScale, smoothScale);
+}
+
+// ---------------------------------------------------------------------------
+// the garment
+// ---------------------------------------------------------------------------
+
+let device = null, sim = null, garmentMesh = null, renderPos = null;
+let garmentColour = 0xc94f4f;
+let ease = 0.030, res = 44;
+let trackedFrames = 0, autoDraped = false;
+
+// The twin's live body frame, in model space. Derived from bone POSITIONS
+// rather than a world quaternion, so it stays correct under the mirror.
+const _bfL = new THREE.Vector3(1, 0, 0);
+const _bfU = new THREE.Vector3(0, 1, 0);
+const _bfF = new THREE.Vector3(0, 0, 1);
+const FRAME = { left: _bfL, up: _bfU, front: _bfF };
+function bodyFrame() {
+  const P = (n) => {
+    const bone = boneByName.get(norm(n));
+    return bone ? twinModel.worldToLocal(bone.getWorldPosition(new THREE.Vector3())) : null;
+  };
+  const sl = P("upperarm01.L"), sr = P("upperarm01.R");
+  const hl = P("upperleg01.L"), hr = P("upperleg01.R");
+  // Fall back to the identity frame rather than producing NaNs: a NaN capsule
+  // silently disables collision and the shirt falls through the floor.
+  if (!sl || !sr || !hl || !hr) return FRAME;
+  _bfL.subVectors(sl, sr).normalize();
+  _bfU.copy(sl).add(sr).multiplyScalar(0.5)
+      .sub(hl.add(hr).multiplyScalar(0.5)).normalize();
+  _bfF.crossVectors(_bfL, _bfU).normalize();
+  _bfU.crossVectors(_bfF, _bfL).normalize();
+  return FRAME;
+}
+
+function drape() {
+  if (!device || !twinModel || !capsules.length) return;
+  try {
+    twinModel.updateMatrixWorld(true);
+    poseCapsules(capsules, twinModel, bodyFrame(), 0);
+
+    const drafted = draftShirt({ caps: capsules, res, ease });
+    if (!sim) sim = new GarmentSim(device, { substeps: 6 });
+    sim.spawn(drafted, capsules.length);
+    sim.iterations = 6;
+    syncUI();
+
+    if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
+    const built = buildGarmentGeometry(drafted);
+    renderPos = built.renderPos;
+    garmentMesh = new THREE.Mesh(built.geometry, new THREE.MeshStandardMaterial({
+      color: garmentColour, roughness: 0.86, metalness: 0.0,
+      side: THREE.DoubleSide,
+    }));
+    // Child of twinModel, so it inherits the hip offset, the metres→pixels
+    // scale AND the mirror — exactly the same transform chain the body gets.
+    twinModel.add(garmentMesh);
+    autoDraped = true;
+    errEl.textContent = "";
+  } catch (e) {
+    errEl.textContent = `drape failed: ${e.message}`;
+    console.error(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ui
+// ---------------------------------------------------------------------------
+
+function syncUI() {
+  // Bend compliance spans many orders of magnitude, so the slider is
+  // logarithmic: 0 = a board, 100 = a silk scarf.
+  const bendVal = Number($("bend").value);
+  const compliance = bendVal === 0 ? 0 : Math.pow(10, -8 + bendVal / 12.5);
+  if (sim) { sim.bendCompliance = compliance; sim.friction = Number($("fric").value) / 100; }
+  $("bendv").textContent = compliance ? compliance.toExponential(0) : "rigid";
+  $("fricv").textContent = $("fric").value;
+  $("resv").textContent = res;
+  $("easev").textContent = `${ease >= 0 ? "+" : ""}${Math.round(ease * 1000)}`;
+}
+["bend", "fric"].forEach((id) => $(id).addEventListener("input", syncUI));
+$("ease").addEventListener("input", () => {
+  $("easev").textContent = `${$("ease").value > 0 ? "+" : ""}${$("ease").value}`;
+});
+// Ease and resolution change the CUT of the garment, so the mesh must be
+// rebuilt — they are not runtime parameters like compliance. Same distinction
+// as in real production: pattern dimensions are baked per size.
+$("ease").addEventListener("change", (e) => { ease = Number(e.target.value) / 1000; drape(); });
+$("res").addEventListener("change", (e) => { res = Number(e.target.value); drape(); });
+$("drape").addEventListener("click", drape);
+$("vop").addEventListener("input", (e) => { video.style.opacity = String(e.target.value / 100); });
+
+document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
+  garmentColour = parseInt(el.dataset.c, 16);
+  if (garmentMesh) garmentMesh.material.color.setHex(garmentColour);
+}));
+
+$("bodymode").addEventListener("change", (e) => setBodyMode(e.target.value));
+function setBodyMode(mode) {
+  if (!bodyMat || !skinned) return;
+  skinned.visible = mode !== "off";
+
+  // "occlude": the body writes DEPTH but no colour. That is the standard AR
+  // occlusion trick, and it is what lets an arm crossing in front of your
+  // chest hide the shirt behind it. Without it the garment always draws on
+  // top, because the video plane carries no depth information at all.
+  //
+  // The subtlety is the RENDER PASS. Three.js draws all opaque objects first,
+  // then all transparent ones, and renderOrder only sorts WITHIN a pass. Left
+  // transparent, the occluder would be drawn after the (opaque) garment and
+  // have nothing to occlude. So the occluder must be opaque — it writes no
+  // colour anyway, which is precisely why that is free.
+  bodyMat.colorWrite = mode !== "occlude";
+  bodyMat.transparent = mode === "ghost";
+  bodyMat.opacity = mode === "ghost" ? 0.32 : 1.0;
+  bodyMat.depthWrite = true;
+  bodyMat.needsUpdate = true;
+  // Depth-only pass must run BEFORE the garment or it has nothing to test
+  // against; the ghost is a look, so it goes last and blends over the top.
+  skinned.renderOrder = mode === "ghost" ? 1 : -1;
+}
+
+let showDots = false;
+addEventListener("keydown", (e) => {
+  if (e.key === " ") { drape(); e.preventDefault(); }
+  if (e.key === "d") { showDots = !showDots; if (!showDots) dotsCtx.clearRect(0, 0, W, H); }
+  if (e.key === "w" && garmentMesh) {
+    garmentMesh.material.wireframe = !garmentMesh.material.wireframe;
+  }
+});
+
+const dotsCtx = $("dots").getContext("2d");
+// Independent of the twin entirely: if dots appear, MediaPipe sees you and any
+// remaining problem is in the twin's maths. If no dots, it's detection or
+// framing. Separating those two failure modes is the whole point.
+function drawDots(lms) {
+  dotsCtx.clearRect(0, 0, W, H);
+  if (!lms) return;
+  dotsCtx.fillStyle = "#ff3355";
+  for (const lm of lms) {
+    dotsCtx.beginPath();
+    dotsCtx.arc((1 - lm.x) * W, lm.y * H, 3, 0, Math.PI * 2);
+    dotsCtx.fill();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// loop
+// ---------------------------------------------------------------------------
+
+const ready = { twin: false, gpu: false, pose: false };
+let started = false;
+function boot() {
+  if (started || !ready.twin || !ready.gpu || !ready.pose) return;
+  started = true;
+  setBodyMode($("bodymode").value);
+  syncUI();
+  loop();
+}
+
+let lastVideoTime = -1, lastFrame = performance.now(), lastPose = 0;
+let fps = 0, frames = 0, acc = 0, solveMs = 0;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  // Clamp: a long stall (tab backgrounded, GC pause) would otherwise inject a
+  // huge dt and blow the solver up.
+  const dt = Math.min((now - lastFrame) / 1000, 1 / 25);
+  lastFrame = now;
+
+  let detected = false;
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res2 = landmarker.detectForVideo(video, now);
+    detected = Boolean(res2.worldLandmarks?.length && res2.landmarks?.length);
+
+    if (detected && plan.length) {
+      const sw = smoothLandmarks(res2.worldLandmarks[0], worldFilters, now);
+
+      // Collect measurements over ~1.5 s before fitting: a single frame is far
+      // too noisy to solve against.
+      if (fitData && !fitApplied && skinned) {
+        // pass the RAW landmarks too — visibility lives there, not on the
+        // smoothed copies
+        const sample = measurePerson(sw, res2.worldLandmarks[0]);
+        const mask = res2.segmentationMasks?.[0];
+        if (mask && sample.torso) {
+          Object.assign(sample, measureSilhouette(mask, res2.landmarks[0], sample.torso));
+        }
+        measureSamples.push(sample);
+        if (measureSamples.length >= FIT_FRAMES) {
+          fitShape();
+          // Always clear. If the fit bailed we must start a fresh window rather
+          // than re-solving the same stale samples every frame — that is what
+          // once produced 244 repeated attempts.
+          measureSamples.length = 0;
+        }
+      }
+
+      retarget(sw, res2.worldLandmarks[0]);
+      align(smoothLandmarks(res2.landmarks[0], imageFilters, now));
+      alignGroup.updateMatrixWorld(true);
+
+      const poseDt = lastPose ? (now - lastPose) / 1000 : 0;
+      lastPose = now;
+      if (capsules.length) poseCapsules(capsules, twinModel, bodyFrame(), poseDt);
+
+      trackedFrames++;
+      // Auto-drape once tracking is steady and the shape fit has had its go.
+      // Spawning earlier drafts the shirt around a body that is about to
+      // change. The frame cap is the escape hatch: shape fitting can bail
+      // indefinitely (legs out of frame, arms foreshortened), and waiting
+      // forever for it would look like the page had simply hung.
+      if (!autoDraped && trackedFrames > 60 &&
+          (fitApplied || !fitData || trackedFrames > 300)) drape();
+    }
+    if (showDots) drawDots(res2.landmarks?.[0]);
+
+    // MPMask owns GPU/WASM-side memory the JS garbage collector cannot
+    // reclaim. Segmentation runs every frame, so failing to close it leaks
+    // steadily until the tab dies. Must happen after all reads above.
+    res2.segmentationMasks?.forEach((m) => m.close());
+  }
+
+  if (sim?.gpu && garmentMesh) {
+    const t0 = performance.now();
+    sim.setCapsules(capsules);
+    if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
+    solveMs = solveMs * 0.9 + (performance.now() - t0) * 0.1;
+  }
+
+  frames++; acc += dt;
+  if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
+  statusEl.innerHTML = detected || trackedFrames
+    ? `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(1)} ms` +
+      (sim?.sim ? ` · ${sim.sim.N} particles` : "") +
+      `<br><span style="color:${detected ? "#8c8" : "#fa0"}">` +
+      `${detected ? `tracking · ${smoothScale.toFixed(0)} px/m` : "no pose"}</span>`
+    : "waiting for a person…";
+
+  renderer.render(scene, camera);
+}
+
+// ---------------------------------------------------------------------------
+// boot
+// ---------------------------------------------------------------------------
+
+(async () => {
+  // Report which STEP failed and the error's .name — DOMExceptions from
+  // getUserMedia often have an empty .message but a precise .name.
+  let step = "WebGPU";
+  try {
+    device = await createDevice();
+    device.lost.then((i) => { errEl.textContent = `GPU device lost: ${i.message || i.reason}`; });
+    ready.gpu = true;
+
+    step = "camera";
+    await startCamera();
+    step = "pose model";
+    await loadLandmarker();
+    ready.pose = true;
+    boot();
+  } catch (err) {
+    const name = err?.name || "Error";
+    errEl.innerHTML = `${step} failed: ${name}<br>${err?.message || "(no message)"}` +
+      (name === "NotReadableError"
+        ? "<br>→ another tab or app holds the camera." : "");
+    console.error(step, err);
+  }
+})();
+</script>
+</body>
+</html>
