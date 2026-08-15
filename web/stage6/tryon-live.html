@@ -48,6 +48,9 @@
   <hr />
   <div><button id="drape">put the shirt on</button></div>
   <div class="muted" id="fit">shape: fitting…</div>
+  <label>my height <input id="height" type="number" min="120" max="220" step="1"
+    placeholder="cm" style="width:58px" /> cm
+    <button id="applyHeight">use</button></label>
   <hr />
   <div>colour
     <span class="sw" data-c="c94f4f" style="background:#c94f4f"></span>
@@ -364,8 +367,30 @@ new GLTFLoader().load("../assets/bodytwin.glb", (gltf) => {
 // clamp. Dividing through by torso length cancels it.
 
 let fitData = null, fitApplied = false;
+let userHeightCm = 0;
 const measureSamples = [];
 const FIT_FRAMES = 45;
+// Measurement noise in NORMALISED ratio units. Landmark noise runs ~0.7%
+// relative, and the ratios are ~0.7, so sigma is about 0.005.
+const MEAS_SIGMA = 0.005;
+
+// Prior spread for a well-observed parameter. The morphs are built so +-1
+// spans roughly +-2 SD of the population, so one SD is about 0.5. This makes
+// the regulariser a genuine prior rather than a knob: lambda = sigma^2/prior^2.
+const PRIOR_SD = 0.5;
+
+// Observability threshold on a parameter's weighted JtJ diagonal.
+//
+// Derived, not chosen by feel. The standard error of a parameter is roughly
+// sigma / sqrt(diag). To pin one down to better than DELTA we need
+// diag >= (sigma/DELTA)^2. Taking DELTA = 0.30 — a third of the legal range,
+// beyond which an "estimate" tells you nothing useful — gives
+// (0.005/0.30)^2 = 2.8e-4. Below that the prior takes over smoothly rather
+// than the parameter running to its clamp.
+const OBS_DELTA = 0.30;
+const OBS_TAU = (MEAS_SIGMA / OBS_DELTA) ** 2;
+
+// Kept only to report the old behaviour alongside the new one.
 const RIDGE = 0.0003;
 // muscle is excluded: in Anny it changes limb definition rather than girth, so
 // it moves every measurement we can take by 1-2 mm and noise would pick it.
@@ -468,7 +493,15 @@ function solveLin(A, b) {
 }
 
 function fitShape() {
-  const params = SOLVE_PARAMS.filter((p) => fitData.params.includes(p));
+  let params = SOLVE_PARAMS.filter((p) => fitData.params.includes(p));
+  // A measured stature is worth more than an inferred one: drop `height` from
+  // the solve entirely rather than letting the optimiser spend it on noise.
+  // Honest caveat, visible in the panel: this helps CONDITIONING (the system
+  // loses its best-observed column, so the number drops) but barely moves the
+  // other parameters' standard errors, because height is only ~0.37 correlated
+  // with gender and ~0.41 with proportions. The genuinely collinear pair is
+  // gender and proportions at 0.79.
+  if (userHeightCm > 0) params = params.filter((p) => p !== "height");
   const REF = "torso";
   const avgAbs = {}, seen = {};
   for (const m of fitData.measurements) {
@@ -518,9 +551,30 @@ function fitShape() {
   const d = meas.map((m) => avg[m] - baseNorm[m]);
   const J = meas.map((m) => params.map((p) => jNorm[p][m]));
   const n = params.length;
+
+  // WEIGHTED least squares. A measurement seen in 42% of frames is an average
+  // of fewer samples AND was rejected half the time for a reason — occlusion or
+  // foreshortening — so its error is both noisier and more likely biased.
+  // Counting it equally with one seen in every frame is simply wrong. Weight by
+  // the visible fraction, floored so a rare measurement contributes a little
+  // rather than destabilising the system by vanishing.
+  const wgt = meas.map((m) => Math.max(0.05, seen[m] ?? 0));
+
+  // Per-parameter prior instead of one flat ridge. lambda = sigma^2 / prior^2,
+  // and the prior tightens toward the population mean as observability falls
+  // below OBS_TAU — so a parameter the data cannot see is pulled to neutral
+  // smoothly, rather than being free to sprint to its clamp.
+  const diagJ = params.map((_, i) =>
+    J.reduce((sum, row, k) => sum + wgt[k] * row[i] * row[i], 0));
+  const lambda = diagJ.map((dj) => {
+    const priorSd = dj >= OBS_TAU ? PRIOR_SD : PRIOR_SD * Math.sqrt(Math.max(dj, 0) / OBS_TAU);
+    return (MEAS_SIGMA * MEAS_SIGMA) / Math.max(priorSd * priorSd, 1e-9);
+  });
+
   const A = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) =>
-    J.reduce((s, row) => s + row[i] * row[j], 0) + (i === j ? RIDGE : 0)));
-  const rhs = Array.from({ length: n }, (_, i) => J.reduce((s, row, k) => s + row[i] * d[k], 0));
+    J.reduce((s, row, k) => s + wgt[k] * row[i] * row[j], 0) + (i === j ? lambda[i] : 0)));
+  const rhs = Array.from({ length: n }, (_, i) =>
+    J.reduce((s, row, k) => s + wgt[k] * row[i] * d[k], 0));
 
   const w = solveLin(A, rhs);
   if (!w) { fitState = "singular"; fitDetail = "normal equations singular"; return; }
@@ -537,9 +591,19 @@ function fitShape() {
   let num = 0, den = 0;
   meas.forEach((m, k) => {
     const pred = params.reduce((a, p, i) => a + jNorm[p][m] * w[i], 0);
-    num += (pred - d[k]) ** 2; den += d[k] ** 2;
+    num += wgt[k] * (pred - d[k]) ** 2; den += wgt[k] * d[k] ** 2;
   });
   const residual = den > 1e-12 ? Math.sqrt(num / den) : 0;
+
+  // How far the measurements sit outside anything the morphs can express.
+  // sum|J| over the legal box is the largest deviation a parameter vector can
+  // produce for each measurement; a target beyond it is unreachable at ANY
+  // ridge, and the solve can only respond by running to a clamp. This is the
+  // number that distinguishes "noisy" from "this body is not in the model".
+  const unreachable = meas.filter((m, k) => {
+    const span = params.reduce((a, p) => a + Math.abs(jNorm[p][m]), 0);
+    return Math.abs(d[k]) > span;
+  });
 
   const clamped = w.map((v) => THREE.MathUtils.clamp(v, -1, 1));
   const pinned = params.filter((_, i) => Math.abs(clamped[i]) >= FIT_CLAMP_EPS);
@@ -552,7 +616,14 @@ function fitShape() {
     measurements: fitData.measurements.map((m) => ({
       name: m, avg: avgAbs[m], seen: seen[m] ?? 0, used: meas.includes(m),
     })),
-    diag: params.map((p, i) => ({ p, d: diag[i] ?? null, value: w[i] })),
+    diag: params.map((p, i) => ({
+      p, d: diagJ[i], value: w[i], lambda: lambda[i],
+      weak: diagJ[i] < OBS_TAU,
+      stderr: MEAS_SIGMA / Math.sqrt(Math.max(diagJ[i], 1e-9)),
+    })),
+    weights: meas.map((m, k) => ({ m, w: wgt[k] })),
+    unreachable: unreachable.map((m) => m),
+    heightFixed: userHeightCm > 0,
   };
 
   // A parameter resting exactly on its rail is the solver reporting that the
@@ -560,7 +631,13 @@ function fitShape() {
   // guess as a measurement.
   if (pinned.length) {
     fitState = "saturated";
-    fitDetail = `${pinned.join(", ")} at clamp — inputs don't determine shape`;
+    // Name the actual cause. Pinning with a LOW residual means the data is
+    // ambiguous; pinning with a HIGH residual means the model cannot represent
+    // this body and no amount of regularisation will change that.
+    fitDetail = unreachable.length
+      ? `${pinned.join(", ")} at clamp — ${unreachable.length} measurement(s) ` +
+        `outside the morph range (${unreachable.join(", ")})`
+      : `${pinned.join(", ")} at clamp — data doesn't determine shape`;
     return;
   }
   if (residual > FIT_MAX_RESIDUAL) {
@@ -1046,6 +1123,16 @@ $("ease").addEventListener("input", () => {
 $("ease").addEventListener("change", (e) => { ease = Number(e.target.value) / 1000; drape(); });
 $("res").addEventListener("change", (e) => { res = Number(e.target.value); drape(); });
 $("drape").addEventListener("click", drape);
+$("applyHeight").addEventListener("click", () => {
+  const v = Number($("height").value);
+  userHeightCm = v >= 120 && v <= 220 ? v : 0;
+  // Re-run the capture: the parameter set changed, so the old solve no longer
+  // describes the system we are now solving.
+  measureSamples.length = 0;
+  fitApplied = false;
+  fitState = "waiting";
+  fitDetail = userHeightCm ? `height fixed at ${userHeightCm} cm` : "height not set";
+});
 $("vop").addEventListener("input", (e) => { video.style.opacity = String(e.target.value / 100); });
 
 document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
@@ -1198,16 +1285,27 @@ function renderPanel() {
   h.push(row("samples", `${measureSamples.length}/${FIT_FRAMES}`));
   if (lastFit) {
     h.push(row("residual", fmt(lastFit.residual)));
+    if (lastFit.unreachable?.length) {
+      h.push(`<div class="row"><span class="fail">unreachable</span>` +
+             `<span>${lastFit.unreachable.join(", ")}</span></div>`);
+      h.push(`<div class="row"><span class="fail">\u2192 outside morph range</span>` +
+             `<span>model can't express this body</span></div>`);
+    }
+    h.push(row("height", lastFit.heightFixed ? "fixed by user" : "solved"));
     for (const d of lastFit.diag) {
       const pin = Math.abs(THREE.MathUtils.clamp(d.value, -1, 1)) >= FIT_CLAMP_EPS;
-      h.push(`<div class="row"><span>${d.p}</span><span class="${pin ? "fail" : ""}">` +
-             `${fmt(d.value, 2)}${pin ? " PINNED" : ""} (J\u1d40J ${fmt(d.d, 4)})</span></div>`);
+      h.push(`<div class="row"><span class="${d.weak ? "wait" : ""}">${d.p}</span>` +
+             `<span class="${pin ? "fail" : ""}">${fmt(d.value, 2)}${pin ? " PINNED" : ""} ` +
+             `\u00b1${fmt(d.stderr, 2)} (J\u1d40J ${fmt(d.d, 4)}, \u03bb ${d.lambda.toExponential(0)})` +
+             `</span></div>`);
     }
     h.push("<h4>fit inputs</h4>");
     for (const m of lastFit.measurements) {
+      const wt = lastFit.weights?.find((x) => x.m === m.name);
       h.push(`<div class="row"><span class="${m.used ? "pass" : "fail"}">${m.name}</span>` +
              `<span>${m.avg == null ? "\u2014" : (m.avg * 100).toFixed(1) + " cm"} ` +
-             `seen ${(m.seen * 100).toFixed(0)}%</span></div>`);
+             `seen ${(m.seen * 100).toFixed(0)}%` +
+             `${wt ? ` w=${wt.w.toFixed(2)}` : ""}</span></div>`);
     }
   }
 
