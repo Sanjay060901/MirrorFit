@@ -27,6 +27,10 @@
 
 import * as THREE from "three";
 
+// Signed distance along an axis. Used before the drafting frame's own
+// heightOf() closure exists.
+const heightOfRaw = (v, axis) => v.dot(axis);
+
 // Capsules are an approximation and the real mesh bulges outside them at the
 // deltoids and chest. Cloth held exactly at the capsule surface gets pierced
 // wherever that happens. Inflating the collision radius keeps fabric clear of
@@ -303,7 +307,7 @@ export function capsuleByLabel(caps) {
  * hip radii. Two armholes are cut in it, and the sleeves are separate tubes
  * sewn to the armhole rims.
  */
-export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
+export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null }) {
   const m = capsuleByLabel(caps);
   const chest = m.get("chest"), waist = m.get("waist"), hips = m.get("hips");
   const neck = m.get("neck"), shL = m.get("shoulderL"), shR = m.get("shoulderR");
@@ -336,12 +340,28 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
   const hipMid = hips.a.clone();
   const hipRx = hips.rx, hipRz = hips.rz;
 
+  // HEM LENGTH from a garment spec, not a magic number.
+  //
+  // A men's medium tee measures ~71 cm high-point-shoulder to hem, on a body
+  // whose shoulder-to-hip-joint is ~52 cm — a ratio of about 1.37. Applying
+  // the ratio rather than the absolute length is what makes it grade with the
+  // wearer instead of being right for one body only.
+  const TEE_LENGTH_RATIO = 1.37;
+
   // The neck opening has to clear the neck's COLLISION radius, not its
   // measured radius. Cut to the raw measurement, the hole is smaller than the
   // thing it must pass over, and collision ejects the whole garment sideways
   // every frame. Anything the garment slips over is sized against the inflated
   // collision geometry.
-  const neckR = neck.rx + COLLISION_MARGIN + 0.022;
+  //
+  // Sized against a real crew neck rather than a guess: a men's tee measures
+  // 40-44 cm around the opening, so the radius wants to be ~0.066-0.070 m. The
+  // previous +0.022 slack gave 47.8 cm, noticeably wider than any real tee,
+  // which let the whole garment drop through. Clamped, not just computed, so a
+  // thick-necked body still gets an opening it can physically wear.
+  const NECK_CIRCUM_TARGET = 0.42;
+  const neckFloor = neck.rx + COLLISION_MARGIN + 0.004;   // must clear the neck
+  const neckR = Math.max(neckFloor, NECK_CIRCUM_TARGET / (2 * Math.PI));
 
   // ---- the garment's centre line ----
   //
@@ -357,16 +377,40 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
   // This is close to how a pattern is actually drafted: a centre-front line
   // plus a girth at each level.
   const anchor = (p, rx, rz) => ({ p: p.clone(), rx, rz });
+
+  // THE SHOULDER LINE. Measured, not assumed.
+  //
+  // This was the single biggest error in the garment: the yoke's widest ring
+  // was anchored to spine01, on the belief that it marked the shoulders. It
+  // does not — measured on the twin, spine01 sits 76 mm BELOW the shoulder
+  // joints. So the garment's widest point landed at mid-chest and nothing at
+  // all rested on the shoulders. A shirt held up by nothing slides down and
+  // pools, which is exactly what "settles as a sack" looks like.
+  //
+  // Take the HEIGHT from the shoulder joints and everything else from the
+  // torso's centre line, so the ring keeps the forward offset that puts it
+  // inside the chest rather than behind it.
+  const shoulderHeight = armL && armR
+    ? (heightOfRaw(armL.a, up) + heightOfRaw(armR.a, up)) / 2
+    : heightOfRaw(chest.b, up);
+  const shoulderPoint = chest.b.clone()
+    .addScaledVector(up, shoulderHeight - heightOfRaw(chest.b, up));
+
   const yokeChain = [
     anchor(neck.a, neckR, neckR),
-    anchor(chest.b, halfShoulder, chest.rz + ease),
+    anchor(shoulderPoint, halfShoulder, chest.rz + ease),
   ];
+  // Resolve the hem now that the shoulder line is known. hemDrop is how far
+  // below the hip JOINTS the hem falls.
+  const shoulderToHip = shoulderHeight - heightOfRaw(hipMid, up);
+  const hemDropM = hemDrop ?? Math.max(0.04, shoulderToHip * (TEE_LENGTH_RATIO - 1));
+
   const bodyChain = [
-    anchor(chest.b, halfShoulder, chest.rz + ease),
+    anchor(shoulderPoint, halfShoulder, chest.rz + ease),
     anchor(chest.a, chest.rx + ease, chest.rz + ease),
     anchor(waist.a, waist.rx + ease, waist.rz + ease),
     anchor(hipMid, hipRx + ease, hipRz + ease),
-    anchor(hipMid.clone().addScaledVector(up, -hemDrop), hipRx + ease, hipRz + ease),
+    anchor(hipMid.clone().addScaledVector(up, -hemDropM), hipRx + ease, hipRz + ease),
   ];
 
   // Sample a chain by arc length, so rows are evenly spaced down the fabric
@@ -418,6 +462,9 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
   // outboard of it — which is pose-independent. With the hole in place the arm
   // hangs outside the tube and presses against it, which is what a real sleeve
   // seam feels like, instead of being trapped inside it.
+  // Anything that silently changes the result must end up visible, not in a
+  // console.warn nobody reads. draftShirt returns this and the panel shows it.
+  const degraded = [];
   const armholeCentres = [];
   for (const [sh, arm] of [[shL, armL], [shR, armR]]) {
     if (!sh || !arm) continue;
@@ -430,9 +477,20 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
     else outward.set(0, 0, 0);
     armholeCentres.push({
       p: arm.a.clone().add(outward),
-      r: arm.rx + COLLISION_MARGIN + 0.030,
+      // Just enough for the arm plus its collision margin to pass through.
+      // An earlier +0.030 made this 0.126 m — a 25 cm hole centred on the
+      // shoulder, which removed the entire shoulder seam and left the shirt
+      // hanging off nothing. The armhole should clear the arm, not the torso.
+      arm,
+      r: arm.rx + COLLISION_MARGIN + 0.012,
+      // Nothing above the shoulder joint may be cut. On a real shirt the
+      // shoulder seam runs OVER the top of the shoulder and the armhole opens
+      // below it; without this ceiling a sphere centred at the joint eats
+      // upward through the yoke, which is exactly what shredded it.
+      ceiling: arm.a.dot(up),
     });
   }
+  const heightOf = (v) => v.dot(up);
 
   const pos = new Float32Array(N * 4);
   const uv = new Float32Array(N * 2);
@@ -458,7 +516,8 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
       pos[i * 4] = tmp.x; pos[i * 4 + 1] = tmp.y; pos[i * 4 + 2] = tmp.z;
       uv[i * 2] = c / NCOL; uv[i * 2 + 1] = 1 - r / NROW;
 
-      const cut = armholeCentres.some((h) => tmp.distanceTo(h.p) < h.r);
+      const cut = armholeCentres.some(
+        (h) => heightOf(tmp) <= h.ceiling && tmp.distanceTo(h.p) < h.r);
       // Inactive particles get w = 0 so predict/collide skip them outright,
       // and they are excluded from constraints and triangles below — inert
       // entries in the buffer. Keeping them in place (rather than compacting
@@ -466,6 +525,30 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
       active[i] = cut ? 0 : 1;
       pos[i * 4 + 3] = cut ? 0 : 1;   // nothing else is pinned; the neck holds it
     }
+  }
+
+  // Tidy the rim. Where the armhole boundary crosses the grid diagonally it
+  // leaves single cells clinging on by one neighbour. Those render as the
+  // spikes fringing the opening, and physically they are a scrap of fabric
+  // hanging off a single thread — it flaps, and it contributes nothing.
+  // Repeatedly drop any particle with fewer than two surviving neighbours
+  // until the edge stops changing.
+  for (let pass = 0; pass < 4; pass++) {
+    let removed = 0;
+    const before = active.slice();
+    for (let r = 0; r < NROW; r++) {
+      for (let c = 0; c < NCOL; c++) {
+        const i = idx(c, r);
+        if (!before[i]) continue;
+        let n = 0;
+        if (before[idx(c - 1, r)]) n++;
+        if (before[idx(c + 1, r)]) n++;
+        if (r > 0 && before[idx(c, r - 1)]) n++;
+        if (r < NROW - 1 && before[idx(c, r + 1)]) n++;
+        if (n < 2) { active[i] = 0; pos[i * 4 + 3] = 0; removed++; }
+      }
+    }
+    if (!removed) break;
   }
 
   // ---- sleeves ----
@@ -477,29 +560,104 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
   const sleeves = [];
   const sleevePos = [], sleeveUv = [];
 
-  for (const arm of [armL, armR]) {
+  // Find the particles on the edge of each armhole: active, but with at least
+  // one neighbour removed. That ring of points IS the armhole.
+  const rimFor = (hole) => {
+    const out = [];
+    for (let r = 0; r < NROW; r++) {
+      for (let c = 0; c < NCOL; c++) {
+        const i = idx(c, r);
+        if (!active[i]) continue;
+        const edge = !active[idx(c - 1, r)] || !active[idx(c + 1, r)] ||
+          (r > 0 && !active[idx(c, r - 1)]) ||
+          (r < NROW - 1 && !active[idx(c, r + 1)]);
+        if (!edge) continue;
+        tmp.set(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
+        // Only this hole's rim, not the other arm's or the neck's.
+        if (tmp.distanceTo(hole.p) > hole.r * 2.0) continue;
+        out.push(i);
+      }
+    }
+    return out;
+  };
+
+  for (let k = 0; k < 2; k++) {
+    const arm = k === 0 ? armL : armR;
     if (!arm) continue;
+    const hole = armholeCentres.find((h) => h.arm === arm);
     const axis = arm.b.clone().sub(arm.a).normalize();
     const alt = Math.abs(axis.dot(up)) < 0.9 ? up : side;
     const u = new THREE.Vector3().crossVectors(axis, alt).normalize();
     const v2 = new THREE.Vector3().crossVectors(axis, u).normalize();
     const rad = arm.rx + COLLISION_MARGIN + ease;
-    const start = 0.02, len = 0.34;     // short sleeve: a third down the arm
+    const len = 0.34;                   // short sleeve: a third down the arm
+
+    // THE SLEEVE HEAD IS THE ARMHOLE.
+    //
+    // Previously the sleeve's top ring was generated around the ARM AXIS while
+    // the armhole rim sits on the TUBE SURFACE — two different surfaces, up to
+    // 157 mm apart on this body. The seam constraints were correctly created
+    // and correctly inextensible, and they faithfully held the sleeve 157 mm
+    // away from the panel. Rigid, and rigidly wrong.
+    //
+    // A real sleeve is cut so its head matches the armhole and is then sewn
+    // edge to edge. So: take the rim, sort it by angle about the arm, resample
+    // it to SCOL points, and make THAT the sleeve's first row. Every seam
+    // stitch then has a rest length of ~0, which is what "sewn" means.
+    const rim = hole ? rimFor(hole) : [];
+    const ringPts = [];
+    if (rim.length >= 6) {
+      const withAngle = rim.map((i) => {
+        const p = new THREE.Vector3(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
+        const d = p.clone().sub(arm.a);
+        return { i, p, th: Math.atan2(d.dot(v2), d.dot(u)) };
+      }).sort((a, b) => a.th - b.th);
+      for (let c = 0; c < SCOL; c++) {
+        // Walk the rim in angular order and pick the nearest sample, so the
+        // sleeve's columns wrap the hole the same way round.
+        const want = -Math.PI + (c / SCOL) * Math.PI * 2;
+        let best = withAngle[0], bestD = Infinity;
+        for (const w of withAngle) {
+          const d = Math.abs(Math.atan2(Math.sin(w.th - want), Math.cos(w.th - want)));
+          if (d < bestD) { bestD = d; best = w; }
+        }
+        ringPts.push({ p: best.p.clone(), body: best.i });
+      }
+    } else {
+      // Degenerate: no armhole was cut (arms raised clear of the tube, say).
+      // Fall back to a plain ring and flag it — silently producing a detached
+      // sleeve is exactly the failure this whole change is about.
+      degraded.push(`sleeve ${k === 0 ? "L" : "R"}: armhole rim had only ` +
+                    `${rim.length} points, sleeve not sewn to the panel`);
+      for (let c = 0; c < SCOL; c++) {
+        const th = (c / SCOL) * Math.PI * 2;
+        ringPts.push({
+          p: arm.a.clone().lerp(arm.b, 0.02)
+            .addScaledVector(u, rad * Math.cos(th))
+            .addScaledVector(v2, rad * Math.sin(th)),
+          body: -1,
+        });
+      }
+    }
 
     const base = N + sleevePos.length / 4;
     for (let r = 0; r < SROW; r++) {
-      const t = start + (r / (SROW - 1)) * len;
+      const f = r / (SROW - 1);
+      const t = 0.02 + f * len;
       const c0 = arm.a.clone().lerp(arm.b, t);
       for (let c = 0; c < SCOL; c++) {
         const th = (c / SCOL) * Math.PI * 2;
-        const pt = c0.clone()
+        // Row 0 sits exactly on the rim; lower rows relax toward a clean tube
+        // around the arm, which is how a set-in sleeve actually transitions.
+        const round = c0.clone()
           .addScaledVector(u, rad * Math.cos(th))
           .addScaledVector(v2, rad * Math.sin(th));
+        const pt = ringPts[c].p.clone().lerp(round, Math.min(1, f * 1.6));
         sleevePos.push(pt.x, pt.y, pt.z, 1);
         sleeveUv.push(c / SCOL, 1 - r / SROW);
       }
     }
-    sleeves.push({ base, SCOL, SROW });
+    sleeves.push({ base, SCOL, SROW, ring: ringPts.map((r) => r.body) });
   }
 
   const TOTAL = N + sleevePos.length / 4;
@@ -512,6 +670,7 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
 
   // ---- constraints ----
   const A = [], B = [], rest = [], kind = [];
+  const seam = { count: 0, maxRest: 0, sumRest: 0 };
   // Sleeve particles live past index N and are always active; body particles
   // may have been removed to form an armhole. A constraint touching a removed
   // particle would tether fabric to a dead point, so drop it. One guard covers
@@ -559,22 +718,29 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
       }
     }
 
-    // Sew the sleeve's top ring to the nearest SURVIVING body vertices. Because
-    // removed particles are skipped, the nearest survivor to a point just
-    // outside the arm is by construction on the rim of the hole we cut around
-    // that arm — so the seam lands on the armhole without us tracing it.
+    // Sew row 0 to the rim particle it was built from. Because the sleeve head
+    // was cut FROM the rim, each stitch has a rest length of about zero — the
+    // two edges are coincident, which is what a sewn seam is.
     for (let c = 0; c < s.SCOL; c++) {
       const si = sidx(s, c, 0);
-      let best = -1, bestD = Infinity;
-      for (let bi = 0; bi < N; bi++) {
-        if (!active[bi]) continue;
-        const dx = allPos[si * 4] - allPos[bi * 4];
-        const dy = allPos[si * 4 + 1] - allPos[bi * 4 + 1];
-        const dz = allPos[si * 4 + 2] - allPos[bi * 4 + 2];
-        const d = dx * dx + dy * dy + dz * dz;
-        if (d < bestD) { bestD = d; best = bi; }
+      const best = s.ring ? s.ring[c] : -1;
+      const bestD = best >= 0 ? (
+        (allPos[si * 4] - allPos[best * 4]) ** 2 +
+        (allPos[si * 4 + 1] - allPos[best * 4 + 1]) ** 2 +
+        (allPos[si * 4 + 2] - allPos[best * 4 + 2]) ** 2) : 0;
+      // kind 0 == the stretch group, whose compliance is hard-wired to 0 in
+      // GarmentSim.step — i.e. an inextensible seam, which is what a stitched
+      // seam is. Recorded so the debug panel can prove the seam exists and how
+      // long each stitch is: a stitch whose rest length is a large fraction of
+      // the sleeve radius means the sleeve is tacked on at a distance rather
+      // than sewn to the armhole rim, and it will read as "floating".
+      if (best >= 0) {
+        add(si, best, 0);
+        seam.count++;
+        const d = Math.sqrt(bestD);
+        seam.maxRest = Math.max(seam.maxRest, d);
+        seam.sumRest += d;
       }
-      if (best >= 0) add(si, best, 0);
     }
   }
 
@@ -612,8 +778,32 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = 0.10 }) {
               `${A.length} constraints, ${groups[0].ranges.length}+` +
               `${groups[1].ranges.length} colours`);
 
+  // Everything the debug panel needs to show measured-body -> drafted-garment
+  // without recomputing any of it.
+  const profile = {
+    neckR, neckCircum: 2 * Math.PI * neckR,
+    halfShoulder,
+    chestRx: chest.rx, waistRx: waist.rx, hipRx,
+    ease,
+    shoulderRingHeight: heightOf(yokeChain[1].p),
+    shoulderJointHeight: armL ? heightOf(armL.a) : null,
+    neckHeight: heightOf(neck.a),
+    hemHeight: heightOf(bodyChain[bodyChain.length - 1].p),
+    garmentLength: heightOf(yokeChain[0].p) - heightOf(bodyChain[bodyChain.length - 1].p),
+    shoulderToHip,
+    shoulderToHem: shoulderHeight - heightOf(bodyChain[bodyChain.length - 1].p),
+    lengthRatio: (shoulderHeight - heightOf(bodyChain[bodyChain.length - 1].p)) / shoulderToHip,
+    targetLengthRatio: TEE_LENGTH_RATIO,
+    hemDrop: hemDropM,
+    degraded,
+    seam: { count: seam.count, maxRest: seam.maxRest,
+            avgRest: seam.count ? seam.sumRest / seam.count : 0 },
+    constraints: { total: A.length,
+                   stretch: kind.filter((k) => k === 0).length,
+                   bend: kind.filter((k) => k === 1).length },
+  };
   return { N: TOTAL, pos: allPos, uv: allUv, active, groups, idx,
-           NCOL, NROW, bodyCount: N, sleeves };
+           NCOL, NROW, bodyCount: N, sleeves, profile };
 }
 
 function greedyColour(cA, cB, numParticles) {
@@ -1056,6 +1246,48 @@ export class GarmentSim {
       geometry.computeVertexNormals();
     }).catch(() => { /* device lost or buffer destroyed mid-flight */ });
   }
+}
+
+/**
+ * Fabric material for a garment.
+ *
+ * Three things, all of which the previous MeshStandardMaterial lacked:
+ *
+ *  - OPAQUE and double-sided. Cloth is not glass. Double-sided is not
+ *    optional either: the mirror's negative x scale inverts triangle winding,
+ *    so single-sided fabric is backface-culled into invisibility.
+ *  - SHEEN. Real cloth has a soft retroreflective lobe from the fibre nap —
+ *    it is the main thing that separates fabric from painted plastic, and
+ *    MeshPhysicalMaterial models it directly.
+ *  - A THICKNESS OFFSET. The simulation treats the garment as an infinitely
+ *    thin surface, so wherever it rests exactly on the collision surface the
+ *    body co-planar with it wins pixels at random and shows through as
+ *    mottling. Pushing the rendered surface a millimetre or two out along its
+ *    normal gives the fabric apparent thickness and removes the fight. It is
+ *    done in the vertex shader, so it costs nothing and never feeds back into
+ *    the physics.
+ */
+export function makeGarmentMaterial(colour = 0xc94f4f, thickness = 0.004) {
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: colour,
+    roughness: 0.88,
+    metalness: 0.0,
+    sheen: 0.55,
+    sheenRoughness: 0.75,
+    sheenColor: new THREE.Color(0xffffff),
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1.0,
+  });
+  mat.userData.thickness = { value: thickness };
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uThickness = mat.userData.thickness;
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nuniform float uThickness;")
+      .replace("#include <begin_vertex>",
+               "#include <begin_vertex>\ntransformed += normalize(objectNormal) * uThickness;");
+  };
+  return mat;
 }
 
 /** Build the renderable mesh for a drafted garment. */

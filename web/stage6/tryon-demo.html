@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 6.5 — garment demo (no camera)</title>
+<style>
+  body { margin: 0; background: #0d0d0f; color: #ddd; font-family: system-ui, sans-serif;
+         display: grid; place-items: center; min-height: 100vh; }
+  #stage { position: relative; width: 640px; height: 480px; background: #16161a;
+           border-radius: 6px; overflow: hidden; box-shadow: 0 8px 40px rgba(0,0,0,.6); }
+  canvas { display: block; }
+  #ui { position: fixed; top: 12px; left: 12px; width: 236px;
+        background: rgba(0,0,0,.8); padding: 12px 14px; border-radius: 8px;
+        font-size: 12.5px; line-height: 1.75; }
+  #ui label { display: block; }
+  #ui hr { border: none; border-top: 1px solid #2a2a2a; margin: 9px 0; }
+  input[type=range] { width: 118px; vertical-align: middle; }
+  button { background: #234; color: #cde; border: 1px solid #456; border-radius: 4px;
+           padding: 4px 9px; cursor: pointer; font-size: 12px; }
+  #status { color: #8c8; } #err { color: #f77; }
+  .sw { display: inline-block; width: 17px; height: 17px; border-radius: 3px;
+        border: 1px solid #555; cursor: pointer; vertical-align: middle; margin-right: 3px; }
+  .k { color: #7ab; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div><b>Stage 6.5 — garment demo</b></div>
+  <div id="status">loading…</div>
+  <div id="err"></div>
+  <hr />
+  <div>colour
+    <span class="sw" data-c="c94f4f" style="background:#c94f4f"></span>
+    <span class="sw" data-c="2f5f8f" style="background:#2f5f8f"></span>
+    <span class="sw" data-c="e8e4dc" style="background:#e8e4dc"></span>
+    <span class="sw" data-c="2b2b30" style="background:#2b2b30"></span>
+    <span class="sw" data-c="4d7a52" style="background:#4d7a52"></span>
+  </div>
+  <label>size (ease) <input id="ease" type="range" min="-30" max="90" value="30" />
+    <span id="easev">+30</span> mm</label>
+  <label>drape <input id="bend" type="range" min="0" max="100" value="45" /></label>
+  <label>quality <input id="res" type="range" min="44" max="128" value="96" step="4" />
+    <span id="resv">96</span></label>
+  <label>arms down <input id="arm" type="range" min="0" max="70" value="38" />
+    <span id="armv">38</span>°</label>
+  <hr />
+  <label>body <select id="bodymode">
+    <option value="off">hidden</option>
+    <option value="ghost" selected>ghost</option>
+    <option value="solid">solid</option>
+  </select></label>
+  <label><input type="checkbox" id="spin" checked /> turntable</label>
+  <div><button id="redrape">re-drape</button></div>
+  <div><span class="k">w</span> wireframe · <span class="k">c</span> capsules · drag to orbit</div>
+</div>
+
+<div id="stage"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+import {
+  createDevice, measureCapsules, poseCapsules, draftShirt,
+  GarmentSim, buildGarmentGeometry, makeGarmentMaterial, COLLISION_MARGIN, norm,
+} from "../lib/cloth.js";
+
+// ============================================================================
+// The same garment pipeline as tryon-live.html, with the camera and MediaPipe
+// removed and the pose set by a slider instead.
+//
+// WHY THIS EXISTS. Tracking was never the doubtful part — capsule measurement,
+// drafting and the solver were. Those three are impossible to judge through a
+// webcam feed of a moving person, and impossible to check at all without
+// someone standing in front of a camera. Here the body holds still, the view
+// orbits, and every number is reproducible.
+//
+// It deliberately reproduces the live page's TRANSFORM CHAIN: the model hangs
+// under a group carrying a metres-to-pixels scale and a negative x axis for the
+// mirror. That chain is what broke capsule measurement once already (see
+// docs/TESTING.md), so a demo that skipped it would be demonstrating something
+// other than the product.
+// ============================================================================
+
+const W = 640, H = 480;
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), errEl = $("err");
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x16161a);
+const FOV = 60;
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 1, 8000);
+// Pixel-perfect camera: at this distance 1 world unit == 1 screen pixel at
+// z = 0, which is what lets the live page place the twin in image coordinates.
+camera.position.set(0, 40, H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2)));
+
+// ?shot=name.png — settle, then POST the canvas to scripts/shotserver.py.
+// preserveDrawingBuffer is what makes toDataURL return pixels rather than an
+// empty image, and it costs a little performance, so it is only enabled when a
+// capture was actually asked for.
+const SHOT = new URLSearchParams(location.search).get("shot");
+const renderer = new THREE.WebGLRenderer({
+  antialias: true, preserveDrawingBuffer: Boolean(SHOT) });
+renderer.setSize(W, H);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+$("stage").appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 40, 0);
+controls.autoRotateSpeed = 2.2;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.66));
+const key = new THREE.DirectionalLight(0xffffff, 1.1);
+key.position.set(0.5, 1.6, 2.2);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x88aaff, 0.42);
+rim.position.set(-1.6, 0.5, -1.5);
+scene.add(rim);
+const fill = new THREE.DirectionalLight(0xffddbb, 0.3);
+fill.position.set(1.8, -0.3, -0.8);
+scene.add(fill);
+
+const alignGroup = new THREE.Group();
+scene.add(alignGroup);
+
+const CAPSULE_SPEC = [
+  { label: "chestUpper", a: "spine01", b: "neck01",
+    owners: ["spine01", "breast"], elliptical: true },
+  { label: "chest", a: "spine03", b: "spine01",
+    owners: ["spine02", "spine03", "breast"], elliptical: true },
+  { label: "waist", a: "spine04", b: "spine03",
+    owners: ["spine03", "spine04"], elliptical: true },
+  { label: "hips", a: ["upperleg01.L", "upperleg01.R"], b: "spine04",
+    owners: ["pelvis", "spine04"], elliptical: true },
+  { label: "shoulderL", a: "clavicle.L", b: "upperarm01.L",
+    owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "shoulderR", a: "clavicle.R", b: "upperarm01.R",
+    owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "armL", a: "upperarm01.L", b: "lowerarm01.L",
+    owners: ["upperarm01.L", "upperarm02.L"], elliptical: false },
+  { label: "armR", a: "upperarm01.R", b: "lowerarm01.R",
+    owners: ["upperarm01.R", "upperarm02.R"], elliptical: false },
+  { label: "forearmL", a: "lowerarm01.L", b: "wrist.L",
+    owners: ["lowerarm01.L", "lowerarm02.L"], elliptical: false },
+  { label: "forearmR", a: "lowerarm01.R", b: "wrist.R",
+    owners: ["lowerarm01.R", "lowerarm02.R"], elliptical: false },
+  { label: "neck", a: "neck01", b: "head", owners: ["neck"], elliptical: false },
+];
+
+let device = null, sim = null, skinned = null, twinModel = null, bodyMat = null;
+let garmentMesh = null, renderPos = null, capsuleGroup = null;
+let capsules = [], boneByName = new Map();
+let garmentColour = 0xc94f4f, ease = 0.030, res = 96;
+let armAngle = THREE.MathUtils.degToRad(38);
+
+// ---- the body's own frame, in model space, from bone POSITIONS ----
+// Positions, not a world quaternion: the chain above includes a negative x
+// scale, and a negative-determinant matrix has no clean rotation decomposition.
+const _L = new THREE.Vector3(1, 0, 0);
+const _U = new THREE.Vector3(0, 1, 0);
+const _F = new THREE.Vector3(0, 0, 1);
+const FRAME = { left: _L, up: _U, front: _F };
+function bodyFrame() {
+  const P = (n) => {
+    const b = boneByName.get(norm(n));
+    return b ? twinModel.worldToLocal(b.getWorldPosition(new THREE.Vector3())) : null;
+  };
+  const sl = P("upperarm01.L"), sr = P("upperarm01.R");
+  const hl = P("upperleg01.L"), hr = P("upperleg01.R");
+  if (!sl || !sr || !hl || !hr) return FRAME;
+  _L.subVectors(sl, sr).normalize();
+  _U.copy(sl).add(sr).multiplyScalar(0.5).sub(hl.add(hr).multiplyScalar(0.5)).normalize();
+  _F.crossVectors(_L, _U).normalize();
+  _U.crossVectors(_F, _L).normalize();
+  return FRAME;
+}
+
+// Bring the arms down from the bind A-pose by rotating about the front axis,
+// so we can see how the shirt behaves with arms at the sides — the case that
+// forced armholes to exist in the first place.
+const REST_ARM = new Map();
+function setArms(angle) {
+  for (const [name, sign] of [["upperarm01.L", -1], ["upperarm01.R", 1]]) {
+    const b = boneByName.get(norm(name));
+    if (!b) continue;
+    if (!REST_ARM.has(b)) REST_ARM.set(b, b.quaternion.clone());
+    b.quaternion.copy(REST_ARM.get(b))
+      .multiply(new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 0, 1), sign * angle));
+  }
+  twinModel.updateWorldMatrix(true, true);
+}
+
+function buildCapsuleDebug() {
+  if (capsuleGroup) { alignGroup.remove(capsuleGroup); }
+  capsuleGroup = new THREE.Group();
+  capsuleGroup.visible = false;
+  const mat = new THREE.MeshBasicMaterial({ color: 0xff5599, wireframe: true });
+  for (const c of capsules) {
+    const dir = c.b.clone().sub(c.a);
+    const len = dir.length();
+    // Built round at rx then squashed along the capsule's own front axis, so
+    // the debug view shows the same ellipse the solver tests against.
+    const g = new THREE.CapsuleGeometry(c.rx + COLLISION_MARGIN, Math.max(len, 1e-4), 4, 12);
+    const m = new THREE.Mesh(g, mat);
+    m.position.copy(c.a).add(c.b).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+    m.scale.z = (c.rz + COLLISION_MARGIN) / (c.rx + COLLISION_MARGIN);
+    capsuleGroup.add(m);
+  }
+  twinModel.add(capsuleGroup);
+}
+
+function drape() {
+  try {
+    setArms(armAngle);
+    poseCapsules(capsules, twinModel, bodyFrame(), 0);
+    buildCapsuleDebug();
+
+    const drafted = draftShirt({ caps: capsules, res, ease });
+    if (!sim) sim = new GarmentSim(device, { substeps: 6 });
+    sim.spawn(drafted, capsules.length);
+    sim.iterations = 7;
+    syncUI();
+
+    if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
+    const built = buildGarmentGeometry(drafted);
+    renderPos = built.renderPos;
+    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour));
+    // Child of twinModel, so it inherits the mirror and the pixels-per-metre
+    // scale through exactly the same transform chain the body uses.
+    twinModel.add(garmentMesh);
+
+    const m = new Map(capsules.map((c) => [c.label, c]));
+    const mm = (v) => (v * 1000).toFixed(0);
+    console.log(`drafted: chest ${mm(m.get("chest").rx)}->${mm(m.get("chest").rx + ease)} mm, ` +
+                `waist ${mm(m.get("waist").rx)}->${mm(m.get("waist").rx + ease)}, ` +
+                `hips ${mm(m.get("hips").rx)}->${mm(m.get("hips").rx + ease)}`);
+    errEl.textContent = "";
+  } catch (e) {
+    errEl.textContent = e.message;
+    console.error(e);
+  }
+}
+
+function syncUI() {
+  const b = Number($("bend").value);
+  if (sim) {
+    sim.bendCompliance = b === 0 ? 0 : Math.pow(10, -8 + b / 12.5);
+    sim.friction = 0.85;
+  }
+  $("easev").textContent = `${ease >= 0 ? "+" : ""}${Math.round(ease * 1000)}`;
+  $("armv").textContent = Math.round(THREE.MathUtils.radToDeg(armAngle));
+}
+
+$("bend").addEventListener("input", syncUI);
+$("ease").addEventListener("input", () => {
+  $("easev").textContent = `${$("ease").value > 0 ? "+" : ""}${$("ease").value}`;
+});
+// Ease re-cuts the pattern, so it rebuilds rather than scaling what exists —
+// the same distinction real production makes between a size and a stretch.
+$("ease").addEventListener("change", (e) => { ease = Number(e.target.value) / 1000; drape(); });
+$("arm").addEventListener("change", (e) => {
+  armAngle = THREE.MathUtils.degToRad(Number(e.target.value)); drape();
+});
+$("arm").addEventListener("input", (e) => { $("armv").textContent = e.target.value; });
+$("res").addEventListener("input", (e) => { $("resv").textContent = e.target.value; });
+$("res").addEventListener("change", (e) => { res = Number(e.target.value); drape(); });
+$("redrape").addEventListener("click", drape);
+$("spin").addEventListener("change", (e) => { controls.autoRotate = e.target.checked; });
+document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
+  garmentColour = parseInt(el.dataset.c, 16);
+  if (garmentMesh) garmentMesh.material.color.setHex(garmentColour);
+}));
+$("bodymode").addEventListener("change", (e) => setBodyMode(e.target.value));
+function setBodyMode(mode) {
+  if (!bodyMat || !skinned) return;
+  skinned.visible = mode !== "off";
+  bodyMat.transparent = mode === "ghost";
+  bodyMat.opacity = mode === "ghost" ? 0.30 : 1.0;
+  bodyMat.needsUpdate = true;
+  // three.js draws every opaque object before any transparent one, and
+  // renderOrder only sorts within a pass — so a ghost must come last.
+  skinned.renderOrder = mode === "ghost" ? 1 : -1;
+}
+addEventListener("keydown", (e) => {
+  if (e.key === "w" && garmentMesh) garmentMesh.material.wireframe = !garmentMesh.material.wireframe;
+  if (e.key === "c" && capsuleGroup) capsuleGroup.visible = !capsuleGroup.visible;
+});
+
+let last = performance.now(), frames = 0, acc = 0, fps = 0, solveMs = 0, settled = 0;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  const dt = Math.min((now - last) / 1000, 1 / 25);
+  last = now;
+
+  if (sim?.gpu && garmentMesh) {
+    const t0 = performance.now();
+    sim.setCapsules(capsules);
+    if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
+    solveMs = solveMs * 0.9 + (performance.now() - t0) * 0.1;
+    settled += dt;
+  }
+
+  frames++; acc += dt;
+  if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
+  statusEl.innerHTML = sim?.sim
+    ? `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(2)} ms<br>` +
+      `${sim.sim.N} particles · ${sim.gpu.totalC} constraints<br>` +
+      `settled ${settled.toFixed(1)} s`
+    : "loading…";
+
+  controls.update();
+  renderer.render(scene, camera);
+  maybeCapture();
+}
+
+// Capture only once the cloth has fallen and settled — a shot taken at spawn
+// shows the drafted tube, not the draped garment, and would flatter the result
+// enormously.
+let shotSent = false;
+const SHOT_SETTLE = Number(new URLSearchParams(location.search).get("settle") ?? 4.0);
+function maybeCapture() {
+  if (!SHOT || shotSent || !sim?.gpu || !garmentMesh || settled < SHOT_SETTLE) return;
+  shotSent = true;
+  const png = renderer.domElement.toDataURL("image/png");
+  fetch(`/_shot?name=${encodeURIComponent(SHOT)}`, { method: "POST", body: png })
+    .then((r) => r.text())
+    .then((p) => { document.title = "SHOT SAVED " + p; })
+    .catch((e) => { document.title = "SHOT FAILED " + e.message; });
+}
+
+(async () => {
+  let step = "WebGPU";
+  try {
+    device = await createDevice();
+    device.lost.then((i) => { errEl.textContent = `GPU lost: ${i.message || i.reason}`; });
+
+    step = "body twin";
+    const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+    gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+    if (!skinned) throw new Error("no SkinnedMesh in bodytwin.glb");
+
+    bodyMat = new THREE.MeshStandardMaterial({
+      color: 0x8fb8d8, roughness: 0.75, transparent: true, opacity: 0.30,
+      // The mirror's negative x scale inverts winding; without DoubleSide the
+      // whole body is backface-culled into invisibility.
+      side: THREE.DoubleSide,
+    });
+    skinned.material = bodyMat;
+    // Three.js culls a SkinnedMesh against its REST-pose bounds, so it vanishes
+    // the moment posing moves vertices outside them.
+    skinned.frustumCulled = false;
+
+    twinModel = gltf.scene;
+    alignGroup.add(twinModel);
+    twinModel.updateWorldMatrix(true, true);
+
+    for (const b of skinned.skeleton.bones) boneByName.set(norm(b.name), b);
+    const P = (n) => boneByName.get(norm(n)).getWorldPosition(new THREE.Vector3());
+    const shMid = P("upperarm01.L").add(P("upperarm01.R")).multiplyScalar(0.5);
+    const hipMid = P("upperleg01.L").add(P("upperleg01.R")).multiplyScalar(0.5);
+    const torsoM = shMid.distanceTo(hipMid);
+
+    twinModel.position.sub(hipMid);          // hips at the group origin
+    const scale = (H * 0.30) / torsoM;       // metres -> pixels
+    alignGroup.scale.set(-scale, scale, scale);   // negative x == the mirror
+    alignGroup.position.set(0, -30, 0);
+    alignGroup.updateWorldMatrix(true, true);
+
+    step = "capsules";
+    capsules = measureCapsules(skinned, twinModel, CAPSULE_SPEC);
+    const round = capsules.filter((c) => c.elliptical && Math.abs(c.rx - c.rz) < 1e-6);
+    if (round.length) {
+      // Loudly, not a console.warn nobody reads: an elliptical capsule that
+      // came back round means the measurement fell back and every number
+      // downstream is suspect.
+      errEl.textContent =
+        `DEGRADED: ${round.map((c) => c.label).join(", ")} fell back to round`;
+    }
+
+    step = "garment";
+    setBodyMode($("bodymode").value);
+    controls.autoRotate = $("spin").checked;
+    drape();
+    loop();
+  } catch (e) {
+    statusEl.textContent = "";
+    errEl.innerHTML = `${step} failed: ${e.message}`;
+    window.__fatal = `${step}: ${e.message}`;
+    console.error(step, e);
+  }
+})();
+</script>
+</body>
+</html>

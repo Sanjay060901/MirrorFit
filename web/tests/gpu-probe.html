@@ -1,0 +1,24 @@
+<!DOCTYPE html><meta charset="utf-8"><body><pre id="o">…</pre>
+<script type="module">
+const o = document.getElementById("o");
+const lines = [];
+const withTimeout = (p, ms, label) => Promise.race([
+  p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after " + ms + "ms")), ms)),
+]);
+lines.push("navigator.gpu: " + (navigator.gpu ? "present" : "MISSING"));
+if (navigator.gpu) {
+  try {
+    const a = await withTimeout(navigator.gpu.requestAdapter(), 8000, "requestAdapter");
+    lines.push("adapter: " + (a ? "ok" : "NULL"));
+    if (a) {
+      const i = a.info ?? {};
+      lines.push("  " + (i.vendor||"?") + " / " + (i.architecture||"?") + " / " + (i.description||"?"));
+      const d = await withTimeout(a.requestDevice(), 8000, "requestDevice");
+      lines.push("device: " + (d ? "ok" : "NULL"));
+    }
+  } catch (e) { lines.push("ERR " + e.message); }
+}
+const c = document.createElement("canvas");
+lines.push("webgl2: " + (c.getContext("webgl2") ? "ok" : "MISSING"));
+o.textContent = lines.join("\n");
+</script>

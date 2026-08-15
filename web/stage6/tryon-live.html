@@ -49,8 +49,8 @@
     <span id="bendv" class="muted"></span></label>
   <label>grip <input id="fric" type="range" min="0" max="100" value="85" />
     <span id="fricv">85</span></label>
-  <label>quality <input id="res" type="range" min="32" max="72" value="44" step="4" />
-    <span id="resv">44</span></label>
+  <label>quality <input id="res" type="range" min="32" max="112" value="72" step="4" />
+    <span id="resv">72</span></label>
   <hr />
   <label>body <select id="bodymode">
     <option value="occlude" selected>hidden (occludes)</option>
@@ -82,7 +82,7 @@ import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/
 import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 import {
   createDevice, measureCapsules, poseCapsules, draftShirt,
-  GarmentSim, buildGarmentGeometry, norm,
+  GarmentSim, buildGarmentGeometry, makeGarmentMaterial, norm,
 } from "../lib/cloth.js";
 
 // ============================================================================
@@ -794,7 +794,7 @@ function align(lms) {
 
 let device = null, sim = null, garmentMesh = null, renderPos = null;
 let garmentColour = 0xc94f4f;
-let ease = 0.030, res = 44;
+let ease = 0.030, res = 72;
 let trackedFrames = 0, autoDraped = false;
 
 // The twin's live body frame, in model space. Derived from bone POSITIONS
@@ -836,10 +836,7 @@ function drape() {
     if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
     const built = buildGarmentGeometry(drafted);
     renderPos = built.renderPos;
-    garmentMesh = new THREE.Mesh(built.geometry, new THREE.MeshStandardMaterial({
-      color: garmentColour, roughness: 0.86, metalness: 0.0,
-      side: THREE.DoubleSide,
-    }));
+    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour));
     // Child of twinModel, so it inherits the hip offset, the metres→pixels
     // scale AND the mirror — exactly the same transform chain the body gets.
     twinModel.add(garmentMesh);

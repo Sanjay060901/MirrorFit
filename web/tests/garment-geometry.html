@@ -94,6 +94,54 @@ try {
 
   poseCapsules(caps, root, { left, up, front }, 0);
 
+  // ---- shoulder support geometry ----
+  // Where the garment's widest ring sits relative to the actual shoulder
+  // joints decides whether the shirt HANGS from the shoulders or slides off
+  // them. This is the number that matters for "settles as a sack".
+  const g0 = draftShirt({ caps, res: 44, ease: 0.03 });
+  const pr = g0.profile;
+  const gap = pr.shoulderJointHeight - pr.shoulderRingHeight;
+  say(`
+SHOULDER SUPPORT`);
+  say(`  shoulder joints at height   ${pr.shoulderJointHeight.toFixed(3)} m`);
+  say(`  garment's widest ring at    ${pr.shoulderRingHeight.toFixed(3)} m`);
+  say(`  ring sits ${(gap * 1000).toFixed(0)} mm ${gap > 0 ? "BELOW" : "above"} the joints` +
+      `${gap > 0.02 ? "   <<< nothing rests on the shoulders" : "   ok"}`);
+  say(`  neck opening  r=${pr.neckR.toFixed(3)} m  circumference ` +
+      `${(pr.neckCircum * 100).toFixed(1)} cm  (real crew neck ~40-44 cm)`);
+
+  say(`
+SEAM (sleeve -> body panel)`);
+  say(`  stitches ${pr.seam.count}, avg ${(pr.seam.avgRest * 1000).toFixed(0)} mm, ` +
+      `max ${(pr.seam.maxRest * 1000).toFixed(0)} mm` +
+      `${pr.seam.maxRest > 0.05 ? "   <<< sleeve tacked on at a distance" : "   ok"}`);
+  say(`  constraints ${pr.constraints.total} = ${pr.constraints.stretch} stretch ` +
+      `(compliance 0, inextensible) + ${pr.constraints.bend} bend`);
+
+  say(`
+LENGTH`);
+  const torsoLen = pr.neckHeight - (pr.hemHeight + 0.06);
+  say(`  garment length (neck -> hem) ${(pr.garmentLength * 100).toFixed(1)} cm`);
+  say(`  hem sits ${(pr.hemHeight * 100).toFixed(1)} cm relative to chest centre`);
+
+  // ---- resolution scaling ----
+  // Solve cost is roughly constraints x colours x iterations x substeps. The
+  // colour count matters as much as the constraint count: each colour is a
+  // separate dispatch with a sync between, so colours that grow with
+  // resolution would eat the gain. GPU time itself cannot be measured here —
+  // headless has no WebGPU device on this machine.
+  say(`
+RESOLUTION SCALING`);
+  say(`  res   particles  constraints  colours(stretch+bend)  cut`);
+  for (const r of [44, 52, 64, 80, 96, 112]) {
+    const g = draftShirt({ caps, res: r, ease: 0.03 });
+    const cut = g.bodyCount - g.active.reduce((s, a) => s + a, 0);
+    say(`  ${String(r).padStart(3)}   ${String(g.N).padStart(9)}  ` +
+        `${String(g.profile.constraints.total).padStart(11)}  ` +
+        `${String(g.groups[0].ranges.length + "+" + g.groups[1].ranges.length).padStart(21)}  ` +
+        `${String(cut).padStart(4)}`);
+  }
+
   for (const ease of [-0.01, 0.03, 0.09]) {
     const g = draftShirt({ caps, res: 44, ease });
     let nan = 0;
