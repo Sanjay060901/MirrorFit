@@ -51,6 +51,8 @@
   <label>my height <input id="height" type="number" min="120" max="220" step="1"
     placeholder="cm" style="width:58px" /> cm
     <button id="applyHeight">use</button></label>
+  <label><input type="checkbox" id="allowNeutral" /> show on average build if
+    fit fails</label>
   <hr />
   <div>colour
     <span class="sw" data-c="c94f4f" style="background:#c94f4f"></span>
@@ -368,6 +370,7 @@ new GLTFLoader().load("../assets/bodytwin.glb", (gltf) => {
 
 let fitData = null, fitApplied = false;
 let userHeightCm = 0;
+let allowNeutral = false;
 const measureSamples = [];
 const FIT_FRAMES = 45;
 // Measurement noise in NORMALISED ratio units. Landmark noise runs ~0.7%
@@ -949,10 +952,25 @@ function evaluateGates(imageLms, rawLms) {
   // With no bodyfit.json there is nothing to converge, so the gate would block
   // forever on a condition the user cannot act on. Neutral body, gate open,
   // and the panel says so.
+  // Two different questions, deliberately separated.
+  //
+  // "Can we draft and drape a garment?" depends on the CAPSULES, which are
+  // measured off the mesh and are correct whatever the morphs say. "Can we
+  // claim this size is right for you?" depends on the shape fit. Blocking the
+  // first on the second means a working try-on is hidden because we could not
+  // determine the wearer's build — which is a stricter rule than the product
+  // needs, and stricter than the honest claim requires.
+  //
+  // Default stays as specified: no fit, no garment. With the override the
+  // garment drapes on the NEUTRAL body and every fit-derived claim is labelled
+  // unpersonalised, so nothing on screen implies accuracy we do not have.
+  const fitOk = fitState === "ok" || !fitData;
   out.push({
     key: "fit", label: "shape fit converged",
-    ok: fitState === "ok" || !fitData,
-    detail: !fitData ? "no bodyfit.json — neutral body" : fitDetail,
+    ok: fitOk || allowNeutral,
+    detail: !fitData ? "no bodyfit.json — neutral body"
+      : fitOk ? fitDetail
+      : `${fitDetail} — SHOWING AVERAGE BUILD, size not personalised`,
   });
 
   return out;
@@ -1123,6 +1141,10 @@ $("ease").addEventListener("input", () => {
 $("ease").addEventListener("change", (e) => { ease = Number(e.target.value) / 1000; drape(); });
 $("res").addEventListener("change", (e) => { res = Number(e.target.value); drape(); });
 $("drape").addEventListener("click", drape);
+$("allowNeutral").addEventListener("change", (e) => {
+  allowNeutral = e.target.checked;
+  if (!allowNeutral && fitState !== "ok") autoDraped = false;
+});
 $("applyHeight").addEventListener("click", () => {
   const v = Number($("height").value);
   userHeightCm = v >= 120 && v <= 220 ? v : 0;
