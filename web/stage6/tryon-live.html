@@ -24,6 +24,19 @@
   .muted { color: #888; }
   .sw { display: inline-block; width: 17px; height: 17px; border-radius: 3px;
         border: 1px solid #555; cursor: pointer; vertical-align: middle; margin-right: 3px; }
+  #panel { position: fixed; top: 12px; right: 12px; width: 310px; max-height: 96vh;
+           overflow-y: auto; background: rgba(0,0,0,.84); padding: 10px 12px;
+           border-radius: 8px; font: 11.5px/1.55 ui-monospace, Consolas, monospace; }
+  #panel h4 { margin: 9px 0 3px; font-size: 10.5px; letter-spacing: .09em;
+              text-transform: uppercase; color: #6c7a89; font-weight: 600; }
+  #panel h4:first-child { margin-top: 0; }
+  #panel .row { display: flex; justify-content: space-between; gap: 8px; }
+  #panel .row span:last-child { color: #cfd6dd; text-align: right; }
+  .pass { color: #6d6; } .fail { color: #f66; } .wait { color: #fa0; }
+  #verdict { margin: 2px 0 6px; padding: 6px 8px; border-radius: 5px;
+             font-weight: 600; font-size: 12px; }
+  #verdict.ok { background: #14351c; color: #7de08a; }
+  #verdict.no { background: #3a1414; color: #ff8c8c; }
 </style>
 </head>
 <body>
@@ -60,8 +73,10 @@
   </select></label>
   <label>video <input id="vop" type="range" min="0" max="100" value="100" /></label>
   <div><span class="k">space</span> re-drape · <span class="k">d</span> dots ·
-       <span class="k">w</span> wireframe</div>
+       <span class="k">w</span> wireframe · <span class="k">p</span> panel</div>
 </div>
+
+<div id="panel"></div>
 
 <div id="stage">
   <video id="video" autoplay playsinline muted width="640" height="480"></video>
@@ -331,7 +346,7 @@ new GLTFLoader().load("../assets/bodytwin.glb", (gltf) => {
 
   twinModel.updateMatrixWorld(true);
   capsules = measureCapsules(skinned, twinModel, CAPSULE_SPEC);
-  ready.twin = true;
+  subsystems.twin = true;
   boot();
 }, undefined, (e) => {
   errEl.textContent = "bodytwin.glb missing — run scripts/bodytwin/export_anny_gltf.py";
@@ -461,14 +476,17 @@ function fitShape() {
     seen[m] = vals.length / measureSamples.length;
     avgAbs[m] = vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
   }
-  if (avgAbs[REF] == null || seen[REF] < 0.5) { $("fit").textContent = "torso not visible"; return; }
+  if (avgAbs[REF] == null || seen[REF] < 0.5) {
+    fitState = "insufficient"; fitDetail = "torso not visible"; return;
+  }
 
   const meas = fitData.measurements.filter(
     (m) => m !== REF && avgAbs[m] != null && seen[m] >= 0.5);
   // With few measurements the solve turns arbitrary; better to keep the
   // neutral body and say so than to invent a shape from two numbers.
   if (meas.length < 3) {
-    $("fit").textContent = `only ${meas.length} usable measurements — step back`;
+    fitState = "insufficient";
+    fitDetail = `only ${meas.length} usable measurements`;
     return;
   }
 
@@ -492,7 +510,9 @@ function fitShape() {
   const diag = params.map((p) => meas.reduce((s, m) => s + jNorm[p][m] ** 2, 0));
   const strongest = Math.max(...diag);
   const keep = params.filter((_, i) => diag[i] >= strongest * 0.02);
-  if (!keep.length) { $("fit").textContent = "no observable shape params"; return; }
+  if (!keep.length) {
+    fitState = "insufficient"; fitDetail = "no observable shape params"; return;
+  }
   params.length = 0; params.push(...keep);
 
   const d = meas.map((m) => avg[m] - baseNorm[m]);
@@ -503,12 +523,55 @@ function fitShape() {
   const rhs = Array.from({ length: n }, (_, i) => J.reduce((s, row, k) => s + row[i] * d[k], 0));
 
   const w = solveLin(A, rhs);
-  if (!w) { console.warn("shape fit singular — keeping neutral body"); return; }
+  if (!w) { fitState = "singular"; fitDetail = "normal equations singular"; return; }
   // NaN written into bone positions or morph influences corrupts the mesh
   // permanently; the failure then looks like "the twin disappeared".
-  if (!w.every(Number.isFinite)) { $("fit").textContent = "fit failed (non-finite)"; return; }
+  if (!w.every(Number.isFinite)) {
+    fitState = "singular"; fitDetail = "non-finite solution"; return;
+  }
 
-  applyShape(params, w.map((v) => THREE.MathUtils.clamp(v, -1, 1)));
+  // Residual of the UNCLAMPED solution: how well J.w actually reproduces the
+  // measurements. A tiny residual with a huge w means the system is
+  // ill-conditioned, not that the fit is good — which is why saturation is
+  // checked separately below rather than inferred from residual alone.
+  let num = 0, den = 0;
+  meas.forEach((m, k) => {
+    const pred = params.reduce((a, p, i) => a + jNorm[p][m] * w[i], 0);
+    num += (pred - d[k]) ** 2; den += d[k] ** 2;
+  });
+  const residual = den > 1e-12 ? Math.sqrt(num / den) : 0;
+
+  const clamped = w.map((v) => THREE.MathUtils.clamp(v, -1, 1));
+  const pinned = params.filter((_, i) => Math.abs(clamped[i]) >= FIT_CLAMP_EPS);
+
+  // Everything the solve actually saw, kept for the panel. "Show me the inputs"
+  // is the only way to tell an ill-posed problem from a buggy one.
+  lastFit = {
+    params, raw: w, clamped, residual, pinned,
+    frames: measureSamples.length,
+    measurements: fitData.measurements.map((m) => ({
+      name: m, avg: avgAbs[m], seen: seen[m] ?? 0, used: meas.includes(m),
+    })),
+    diag: params.map((p, i) => ({ p, d: diag[i] ?? null, value: w[i] })),
+  };
+
+  // A parameter resting exactly on its rail is the solver reporting that the
+  // data does not determine it. Refuse the whole fit rather than dress up a
+  // guess as a measurement.
+  if (pinned.length) {
+    fitState = "saturated";
+    fitDetail = `${pinned.join(", ")} at clamp — inputs don't determine shape`;
+    return;
+  }
+  if (residual > FIT_MAX_RESIDUAL) {
+    fitState = "insufficient";
+    fitDetail = `residual ${residual.toFixed(3)} > ${FIT_MAX_RESIDUAL}`;
+    return;
+  }
+
+  applyShape(params, clamped);
+  fitState = "ok";
+  fitDetail = `residual ${residual.toFixed(3)}, ${measureSamples.length} frames`;
 }
 
 function applyShape(params, w) {
@@ -711,6 +774,113 @@ function orientTorso(worldLms, rootBone) {
   rootBone.quaternion.slerp(_rootQ, 0.5);   // slerp, never lerp, for rotations
 }
 
+// ===========================================================================
+// INPUT VALIDATION
+//
+// The failure this exists to stop: the app happily simulated and rendered a
+// garment while the panel said "no pose", wearing a body whose shape params
+// were all pinned at their clamps. Two separate holes let that happen.
+//
+//   1. The solver/render block was gated only on "does a garment exist", never
+//      on "is the pose still valid". Once draped it kept stepping against
+//      capsules frozen at whatever the last good frame left behind.
+//   2. fitShape clamped its solution to +-1 and applied it regardless. A
+//      parameter sitting exactly on its rail is not a measurement — it is the
+//      solver saying "the data does not constrain me and I gave up". Applying
+//      it silently is how you get gender 1.00, weight 1.00, height -1.00 on a
+//      body that is none of those things.
+//
+// The rule now: a garment is only drafted, simulated and drawn when EVERY gate
+// below passes, and the panel always names the gate that failed.
+// ===========================================================================
+
+const VIS_STRICT = 0.6;          // per-landmark visibility for framing
+const FRAME_MARGIN = 0.03;       // normalised; landmark must clear the edge
+const POSE_GRACE_FRAMES = 8;     // brief dropouts shouldn't strip the garment
+const FIT_CLAMP_EPS = 0.97;      // |param| above this counts as saturated
+const FIT_MAX_RESIDUAL = 0.09;   // relative; above this the fit didn't converge
+
+// What must be inside the frame before a full-body fit is even attempted.
+// Legs matter far more than they look: thigh and shin carry the largest
+// Jacobian entries for `height`, so cropping them is precisely what drives
+// that parameter into its clamp.
+const FRAME_REQUIRED = [
+  { key: "head",      idx: [0],       label: "head" },
+  { key: "shoulders", idx: [11, 12],  label: "shoulders" },
+  { key: "hips",      idx: [23, 24],  label: "hips" },
+  { key: "knees",     idx: [25, 26],  label: "knees" },
+  { key: "ankles",    idx: [27, 28],  label: "ankles" },
+];
+
+let framesSincePose = 9999;
+let fitState = "waiting";        // waiting|collecting|insufficient|saturated|singular|ok
+let fitDetail = "no pose yet";
+let lastFit = null;              // full record of what the solve actually saw
+let framingReport = [];
+let gates = [{ key: "pose", label: "pose detected", ok: false, detail: "starting" }];
+let ready = false;
+
+function evaluateGates(imageLms, rawLms) {
+  const out = [];
+
+  // --- pose ---
+  out.push({
+    key: "pose", label: "pose detected",
+    ok: framesSincePose <= POSE_GRACE_FRAMES,
+    detail: framesSincePose === 0 ? "this frame"
+      : framesSincePose > 900 ? "never" : `${framesSincePose} frames ago`,
+  });
+
+  // --- framing ---
+  framingReport = [];
+  let framingOk = Boolean(imageLms && rawLms);
+  if (imageLms && rawLms) {
+    for (const part of FRAME_REQUIRED) {
+      let inFrame = true, seen = true;
+      for (const i of part.idx) {
+        const lm = imageLms[i], rw = rawLms[i];
+        if (!lm) { inFrame = false; seen = false; continue; }
+        if (lm.x < FRAME_MARGIN || lm.x > 1 - FRAME_MARGIN ||
+            lm.y < FRAME_MARGIN || lm.y > 1 - FRAME_MARGIN) inFrame = false;
+        if ((rw?.visibility ?? 0) < VIS_STRICT) seen = false;
+      }
+      const ok = inFrame && seen;
+      framingReport.push({ ...part, ok, why: !seen ? "not visible" : !inFrame ? "out of frame" : "" });
+      if (!ok) framingOk = false;
+    }
+  } else {
+    for (const part of FRAME_REQUIRED) framingReport.push({ ...part, ok: false, why: "no pose" });
+  }
+  const missing = framingReport.filter((f) => !f.ok).map((f) => f.label);
+  out.push({
+    key: "framing", label: "full body in frame", ok: framingOk,
+    detail: framingOk ? "all landmarks clear" : `missing: ${missing.join(", ")}`,
+  });
+
+  // --- confidence ---
+  let conf = 0;
+  if (rawLms) {
+    const core = [11, 12, 23, 24];
+    conf = core.reduce((a, i) => a + (rawLms[i]?.visibility ?? 0), 0) / core.length;
+  }
+  out.push({
+    key: "confidence", label: "landmark confidence", ok: conf >= 0.75,
+    detail: conf.toFixed(2),
+  });
+
+  // --- fit ---
+  // With no bodyfit.json there is nothing to converge, so the gate would block
+  // forever on a condition the user cannot act on. Neutral body, gate open,
+  // and the panel says so.
+  out.push({
+    key: "fit", label: "shape fit converged",
+    ok: fitState === "ok" || !fitData,
+    detail: !fitData ? "no bodyfit.json — neutral body" : fitDetail,
+  });
+
+  return out;
+}
+
 const RETARGET_VIS_MIN = 0.5;
 
 function retarget(worldLms, raw) {
@@ -796,6 +966,8 @@ let device = null, sim = null, garmentMesh = null, renderPos = null;
 let garmentColour = 0xc94f4f;
 let ease = 0.030, res = 72;
 let trackedFrames = 0, autoDraped = false;
+let draftProfile = null, steppingLastFrame = false;
+let lastImageLms = null, lastRawLms = null;
 
 // The twin's live body frame, in model space. Derived from bone POSITIONS
 // rather than a world quaternion, so it stays correct under the mirror.
@@ -828,6 +1000,7 @@ function drape() {
     poseCapsules(capsules, twinModel, bodyFrame(), 0);
 
     const drafted = draftShirt({ caps: capsules, res, ease });
+    draftProfile = drafted.profile;
     if (!sim) sim = new GarmentSim(device, { substeps: 6 });
     sim.spawn(drafted, capsules.length);
     sim.iterations = 6;
@@ -908,7 +1081,8 @@ function setBodyMode(mode) {
 let showDots = false;
 addEventListener("keydown", (e) => {
   if (e.key === " ") { drape(); e.preventDefault(); }
-  if (e.key === "d") { showDots = !showDots; if (!showDots) dotsCtx.clearRect(0, 0, W, H); }
+  if (e.key === "d") showDots = !showDots;
+  if (e.key === "p") panelOn = !panelOn;
   if (e.key === "w" && garmentMesh) {
     garmentMesh.material.wireframe = !garmentMesh.material.wireframe;
   }
@@ -919,7 +1093,6 @@ const dotsCtx = $("dots").getContext("2d");
 // remaining problem is in the twin's maths. If no dots, it's detection or
 // framing. Separating those two failure modes is the whole point.
 function drawDots(lms) {
-  dotsCtx.clearRect(0, 0, W, H);
   if (!lms) return;
   dotsCtx.fillStyle = "#ff3355";
   for (const lm of lms) {
@@ -930,13 +1103,174 @@ function drawDots(lms) {
 }
 
 // ---------------------------------------------------------------------------
+// framing coach
+// ---------------------------------------------------------------------------
+// Telling someone "insufficient input" is useless; they cannot act on it. The
+// coach shows the target region, ticks off each body part as it comes into
+// frame, and gives ONE instruction — the most useful next move, not a list.
+function drawCoach(imageLms) {
+  const pad = 0.055;
+  const x0 = pad * W, y0 = pad * H, x1 = (1 - pad) * W, y1 = (1 - pad) * H;
+
+  dotsCtx.save();
+  dotsCtx.setLineDash([9, 7]);
+  dotsCtx.lineWidth = 2;
+  dotsCtx.strokeStyle = ready ? "rgba(110,220,130,.85)" : "rgba(255,170,60,.85)";
+  dotsCtx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  dotsCtx.setLineDash([]);
+
+  // Per-part checklist down the left edge.
+  dotsCtx.font = "600 12px ui-monospace, Consolas, monospace";
+  let ty = y0 + 16;
+  for (const f of framingReport) {
+    dotsCtx.fillStyle = f.ok ? "#6de08a" : "#ff9c5c";
+    dotsCtx.fillText(`${f.ok ? "\u2713" : "\u2717"} ${f.label}`, x0 + 8, ty);
+    ty += 16;
+  }
+
+  // Distance hint from torso height in pixels: too small means step forward,
+  // too large means the frame cannot contain the legs.
+  let hint = "";
+  if (!imageLms) {
+    hint = "step into view";
+  } else {
+    const missing = framingReport.filter((f) => !f.ok);
+    const torsoPx = Math.abs(((imageLms[23].y + imageLms[24].y) / 2 -
+                              (imageLms[11].y + imageLms[12].y) / 2) * H);
+    if (missing.some((m) => m.key === "ankles" || m.key === "knees")) {
+      hint = "step back so your legs are in frame";
+    } else if (missing.some((m) => m.key === "head")) {
+      hint = "step back or tilt the camera up";
+    } else if (torsoPx < H * 0.16) {
+      hint = "step closer";
+    } else if (missing.length) {
+      hint = `turn to face the camera (${missing.map((m) => m.label).join(", ")})`;
+    } else if (fitState === "saturated" || fitState === "insufficient") {
+      hint = "hold still, arms slightly out";
+    } else if (fitState === "collecting") {
+      hint = "hold still\u2026";
+    }
+  }
+
+  if (hint) {
+    dotsCtx.font = "600 17px system-ui, sans-serif";
+    const w = dotsCtx.measureText(hint).width;
+    dotsCtx.fillStyle = "rgba(0,0,0,.66)";
+    dotsCtx.fillRect(W / 2 - w / 2 - 14, y1 - 44, w + 28, 32);
+    dotsCtx.fillStyle = "#ffd9a0";
+    dotsCtx.textAlign = "center";
+    dotsCtx.fillText(hint, W / 2, y1 - 22);
+    dotsCtx.textAlign = "left";
+  }
+  dotsCtx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// debug panel, grouped by pipeline stage
+// ---------------------------------------------------------------------------
+let panelOn = true;
+const panelEl = $("panel");
+const fmt = (v, n = 3) => (v == null || !isFinite(v) ? "\u2014" : v.toFixed(n));
+
+function renderPanel() {
+  if (!panelOn) { panelEl.style.display = "none"; return; }
+  panelEl.style.display = "block";
+
+  const h = [];
+  const blocked = gates.filter((g) => !g.ok);
+  h.push(`<div id="verdict" class="${ready ? "ok" : "no"}">` +
+         `${ready ? "READY \u2014 garment live" : "BLOCKED: " + blocked[0].label}</div>`);
+
+  h.push("<h4>gates</h4>");
+  for (const g of gates) {
+    h.push(`<div class="row"><span class="${g.ok ? "pass" : "fail"}">` +
+           `${g.ok ? "\u2713" : "\u2717"} ${g.label}</span><span>${g.detail}</span></div>`);
+  }
+
+  h.push("<h4>tracking</h4>");
+  h.push(row("frames since pose", framesSincePose > 900 ? "never" : framesSincePose));
+  h.push(row("px per metre", haveAlign ? smoothScale.toFixed(0) : "\u2014"));
+  h.push(row("bones driven", `${plan.length}/${DRIVEN.length}`));
+
+  h.push("<h4>fitting</h4>");
+  h.push(row("state", fitState));
+  h.push(row("detail", fitDetail));
+  h.push(row("samples", `${measureSamples.length}/${FIT_FRAMES}`));
+  if (lastFit) {
+    h.push(row("residual", fmt(lastFit.residual)));
+    for (const d of lastFit.diag) {
+      const pin = Math.abs(THREE.MathUtils.clamp(d.value, -1, 1)) >= FIT_CLAMP_EPS;
+      h.push(`<div class="row"><span>${d.p}</span><span class="${pin ? "fail" : ""}">` +
+             `${fmt(d.value, 2)}${pin ? " PINNED" : ""} (J\u1d40J ${fmt(d.d, 4)})</span></div>`);
+    }
+    h.push("<h4>fit inputs</h4>");
+    for (const m of lastFit.measurements) {
+      h.push(`<div class="row"><span class="${m.used ? "pass" : "fail"}">${m.name}</span>` +
+             `<span>${m.avg == null ? "\u2014" : (m.avg * 100).toFixed(1) + " cm"} ` +
+             `seen ${(m.seen * 100).toFixed(0)}%</span></div>`);
+    }
+  }
+
+  h.push("<h4>capsules</h4>");
+  if (!capsules.length) h.push(row("state", "not measured"));
+  else {
+    const round = capsules.filter((c) => c.elliptical && Math.abs(c.rx - c.rz) < 1e-6);
+    h.push(row("count", capsules.length));
+    h.push(`<div class="row"><span>elliptical fallback</span>` +
+           `<span class="${round.length ? "fail" : "pass"}">` +
+           `${round.length ? round.map((c) => c.label).join(",") : "none"}</span></div>`);
+    for (const c of ["chest", "waist", "hips"]) {
+      const cap = capsules.find((x) => x.label === c);
+      if (cap) h.push(row(c, `rx ${fmt(cap.rx)} rz ${fmt(cap.rz)}`));
+    }
+  }
+
+  h.push("<h4>drafting</h4>");
+  if (!draftProfile) h.push(row("state", "not drafted"));
+  else {
+    const pr = draftProfile;
+    const gap = (pr.shoulderJointHeight - pr.shoulderRingHeight) * 1000;
+    h.push(`<div class="row"><span>yoke vs shoulders</span>` +
+           `<span class="${Math.abs(gap) < 20 ? "pass" : "fail"}">${gap.toFixed(0)} mm</span></div>`);
+    h.push(row("neck circum", `${(pr.neckCircum * 100).toFixed(1)} cm`));
+    h.push(row("chest body\u2192garment",
+               `${(pr.chestRx * 100).toFixed(1)} \u2192 ${((pr.chestRx + pr.ease) * 100).toFixed(1)} cm`));
+    h.push(row("waist body\u2192garment",
+               `${(pr.waistRx * 100).toFixed(1)} \u2192 ${((pr.waistRx + pr.ease) * 100).toFixed(1)} cm`));
+    h.push(row("hips body\u2192garment",
+               `${(pr.hipRx * 100).toFixed(1)} \u2192 ${((pr.hipRx + pr.ease) * 100).toFixed(1)} cm`));
+    h.push(row("length ratio",
+               `${fmt(pr.lengthRatio, 2)} (spec ${fmt(pr.targetLengthRatio, 2)})`));
+    h.push(`<div class="row"><span>seam stitches</span>` +
+           `<span class="${pr.seam.maxRest < 0.02 ? "pass" : "fail"}">` +
+           `${pr.seam.count} @ max ${(pr.seam.maxRest * 1000).toFixed(0)} mm</span></div>`);
+    if (pr.degraded?.length) {
+      for (const d of pr.degraded) h.push(`<div class="row"><span class="fail">DEGRADED</span><span>${d}</span></div>`);
+    }
+  }
+
+  h.push("<h4>solver</h4>");
+  if (!sim?.sim) h.push(row("state", "not spawned"));
+  else {
+    h.push(row("fps", fps.toFixed(0)));
+    h.push(row("solve", `${solveMs.toFixed(2)} ms`));
+    h.push(row("particles", sim.sim.N));
+    h.push(row("constraints", sim.gpu.totalC));
+    h.push(row("stepping", steppingLastFrame ? "yes" : "HALTED (gated)"));
+  }
+
+  panelEl.innerHTML = h.join("");
+}
+function row(k, v) { return `<div class="row"><span>${k}</span><span>${v}</span></div>`; }
+
+// ---------------------------------------------------------------------------
 // loop
 // ---------------------------------------------------------------------------
 
-const ready = { twin: false, gpu: false, pose: false };
+const subsystems = { twin: false, gpu: false, pose: false };
 let started = false;
 function boot() {
-  if (started || !ready.twin || !ready.gpu || !ready.pose) return;
+  if (started || !subsystems.twin || !subsystems.gpu || !subsystems.pose) return;
   started = true;
   setBodyMode($("bodymode").value);
   syncUI();
@@ -944,7 +1278,7 @@ function boot() {
 }
 
 let lastVideoTime = -1, lastFrame = performance.now(), lastPose = 0;
-let fps = 0, frames = 0, acc = 0, solveMs = 0;
+let fps = 0, frames = 0, acc = 0, solveMs = 0, lastPanel = 0;
 
 function loop() {
   requestAnimationFrame(loop);
@@ -960,26 +1294,51 @@ function loop() {
     const res2 = landmarker.detectForVideo(video, now);
     detected = Boolean(res2.worldLandmarks?.length && res2.landmarks?.length);
 
+    framesSincePose = detected ? 0 : framesSincePose + 1;
+    lastImageLms = detected ? res2.landmarks[0] : null;
+    lastRawLms = detected ? res2.worldLandmarks[0] : null;
+
+    // Gates are evaluated BEFORE anything consumes the landmarks, so no stage
+    // can act on input that has already been judged unusable.
+    gates = evaluateGates(lastImageLms, lastRawLms);
+    const framingOk = gates.find((g) => g.key === "framing").ok;
+    const confOk = gates.find((g) => g.key === "confidence").ok;
+    ready = gates.every((g) => g.ok);
+
     if (detected && plan.length) {
       const sw = smoothLandmarks(res2.worldLandmarks[0], worldFilters, now);
 
-      // Collect measurements over ~1.5 s before fitting: a single frame is far
-      // too noisy to solve against.
+      // Collect measurements ONLY while the body is properly framed and
+      // confidently tracked. Previously any detected pose fed the solver,
+      // including one with the legs cropped — and thigh and shin carry the
+      // largest Jacobian entries for `height`, so cropping them is exactly what
+      // drove that parameter to its clamp. Sampling a badly framed body and
+      // then regularising the result is not robustness, it is laundering.
       if (fitData && !fitApplied && skinned) {
-        // pass the RAW landmarks too — visibility lives there, not on the
-        // smoothed copies
-        const sample = measurePerson(sw, res2.worldLandmarks[0]);
-        const mask = res2.segmentationMasks?.[0];
-        if (mask && sample.torso) {
-          Object.assign(sample, measureSilhouette(mask, res2.landmarks[0], sample.torso));
-        }
-        measureSamples.push(sample);
-        if (measureSamples.length >= FIT_FRAMES) {
-          fitShape();
-          // Always clear. If the fit bailed we must start a fresh window rather
-          // than re-solving the same stale samples every frame — that is what
-          // once produced 244 repeated attempts.
+        if (framingOk && confOk) {
+          const sample = measurePerson(sw, res2.worldLandmarks[0]);
+          const mask = res2.segmentationMasks?.[0];
+          if (mask && sample.torso) {
+            Object.assign(sample, measureSilhouette(mask, res2.landmarks[0], sample.torso));
+          }
+          measureSamples.push(sample);
+          if (fitState !== "ok") {
+            fitState = "collecting";
+            fitDetail = `${measureSamples.length}/${FIT_FRAMES} frames`;
+          }
+          if (measureSamples.length >= FIT_FRAMES) {
+            fitShape();
+            // Always clear. If the fit bailed we must start a fresh window
+            // rather than re-solving the same stale samples every frame — that
+            // is what once produced 244 repeated attempts.
+            measureSamples.length = 0;
+          }
+        } else if (measureSamples.length) {
+          // Framing broke mid-capture. Half a capture of a well-framed body
+          // plus half of a cropped one is worse than either, so discard.
           measureSamples.length = 0;
+          fitState = "waiting";
+          fitDetail = "framing lost mid-capture — restarting";
         }
       }
 
@@ -992,15 +1351,16 @@ function loop() {
       if (capsules.length) poseCapsules(capsules, twinModel, bodyFrame(), poseDt);
 
       trackedFrames++;
-      // Auto-drape once tracking is steady and the shape fit has had its go.
-      // Spawning earlier drafts the shirt around a body that is about to
-      // change. The frame cap is the escape hatch: shape fitting can bail
-      // indefinitely (legs out of frame, arms foreshortened), and waiting
-      // forever for it would look like the page had simply hung.
-      if (!autoDraped && trackedFrames > 60 &&
-          (fitApplied || !fitData || trackedFrames > 300)) drape();
+      // Drape only when EVERY gate passes. The old escape hatch — drape anyway
+      // after 300 frames if the fit never converged — is exactly how a garment
+      // ended up on a body whose shape params were all pinned at their clamps.
+      // Waiting visibly, with an instruction on screen, is the honest failure.
+      if (!autoDraped && ready && trackedFrames > 45) drape();
     }
+
+    dotsCtx.clearRect(0, 0, W, H);
     if (showDots) drawDots(res2.landmarks?.[0]);
+    if (!ready) drawCoach(lastImageLms);
 
     // MPMask owns GPU/WASM-side memory the JS garbage collector cannot
     // reclaim. Segmentation runs every frame, so failing to close it leaks
@@ -1008,7 +1368,13 @@ function loop() {
     res2.segmentationMasks?.forEach((m) => m.close());
   }
 
-  if (sim?.gpu && garmentMesh) {
+  // HARD GATE. Not "is there a garment" — "is the input still valid". Stepping
+  // the solver against capsules frozen at the last good frame produces a
+  // garment draped on a body that is no longer there, which is worse than
+  // showing nothing because it looks authoritative.
+  steppingLastFrame = Boolean(sim?.gpu && garmentMesh && ready);
+  if (garmentMesh) garmentMesh.visible = ready;
+  if (steppingLastFrame) {
     const t0 = performance.now();
     sim.setCapsules(capsules);
     if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
@@ -1017,12 +1383,17 @@ function loop() {
 
   frames++; acc += dt;
   if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
-  statusEl.innerHTML = detected || trackedFrames
-    ? `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(1)} ms` +
-      (sim?.sim ? ` · ${sim.sim.N} particles` : "") +
-      `<br><span style="color:${detected ? "#8c8" : "#fa0"}">` +
-      `${detected ? `tracking · ${smoothScale.toFixed(0)} px/m` : "no pose"}</span>`
-    : "waiting for a person…";
+
+  const blocked = gates.filter((g) => !g.ok);
+  statusEl.innerHTML =
+    `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(2)} ms` +
+    (sim?.sim ? ` · ${sim.sim.N} particles` : "") +
+    `<br><span style="color:${ready ? "#8c8" : "#fa0"}">` +
+    (ready ? `ready · ${smoothScale.toFixed(0)} px/m`
+           : `blocked: ${blocked[0]?.label ?? "starting"}`) + `</span>`;
+  // ~8 Hz: fast enough to read, slow enough not to rebuild this much innerHTML
+  // on every frame and fight the GC with the solver.
+  if (now - lastPanel > 120) { lastPanel = now; renderPanel(); }
 
   renderer.render(scene, camera);
 }
@@ -1038,13 +1409,13 @@ function loop() {
   try {
     device = await createDevice();
     device.lost.then((i) => { errEl.textContent = `GPU device lost: ${i.message || i.reason}`; });
-    ready.gpu = true;
+    subsystems.gpu = true;
 
     step = "camera";
     await startCamera();
     step = "pose model";
     await loadLandmarker();
-    ready.pose = true;
+    subsystems.pose = true;
     boot();
   } catch (err) {
     const name = err?.name || "Error";
