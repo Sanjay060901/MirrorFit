@@ -228,7 +228,7 @@ const alignGroup = new THREE.Group();
 scene.add(alignGroup);
 
 let skinned = null, twinModel = null, bodyMat = null;
-let twinTorsoMetres = 0;
+let twinTorsoMetres = 0, twinShoulderMetres = 0;
 const boneByName = new Map();
 const restDirs = new Map();
 const plan = [];
@@ -333,6 +333,8 @@ new GLTFLoader().load("../assets/bodytwin.glb", (gltf) => {
   // Torso is a better yardstick than full height because feet and head are
   // often out of frame or poorly tracked.
   twinTorsoMetres = shoulderMid.distanceTo(hipMid);
+  twinShoulderMetres = restWorld.get(boneOf("upperarm01.L"))
+    .distanceTo(restWorld.get(boneOf("upperarm01.R")));
   twinModel.position.sub(hipMid);      // hips at the group origin
 
   // Seed a plausible scale BEFORE the first detection. 1 unit == 1 pixel here,
@@ -903,12 +905,19 @@ const FIT_MAX_RESIDUAL = 0.09;   // relative; above this the fit didn't converge
 // blocking the garment on the shape fit, one layer up.
 const FRAME_REQUIRED = [
   { key: "shoulders", idx: [11, 12], label: "shoulders", tier: "garment" },
-  { key: "hips",      idx: [23, 24], label: "hips",      tier: "garment" },
+  // Hips are PREFERRED, not required. They give the torso's length and
+  // direction directly; without them we fall back to shoulder width times an
+  // anthropometric ratio, which is an approximation to PLACEMENT — visibly
+  // wrong if it is wrong — not a claim about the wearer's measurements. A
+  // seated user at a desk has their hips below the frame, and refusing to show
+  // anything to that user was not a defensible reading of "validate inputs".
+  { key: "hips",      idx: [23, 24], label: "hips",      tier: "placement" },
   { key: "head",      idx: [0],      label: "head",      tier: "fit" },
   { key: "knees",     idx: [25, 26], label: "knees",     tier: "fit" },
   { key: "ankles",    idx: [27, 28], label: "ankles",    tier: "fit" },
 ];
 let fullBodyFramed = false;
+let hipsVisible = false;
 
 let framesSincePose = 9999;
 let fitState = "waiting";        // waiting|collecting|insufficient|saturated|singular|ok
@@ -943,7 +952,8 @@ function evaluateGates(imageLms, rawLms) {
         if ((rw?.visibility ?? 0) < VIS_STRICT) seen = false;
       }
       const ok = inFrame && seen;
-      framingReport.push({ ...part, ok, why: !seen ? "not visible" : !inFrame ? "out of frame" : "" });
+      framingReport.push({ ...part, ok,
+        why: !inFrame ? "out of frame" : !seen ? "not visible" : "" });
       if (!ok) framingOk = false;
     }
   } else {
@@ -952,12 +962,15 @@ function evaluateGates(imageLms, rawLms) {
   fullBodyFramed = framingOk;
   const torsoParts = framingReport.filter((f) => f.tier === "garment");
   const torsoOk = torsoParts.every((f) => f.ok);
-  const missingTorso = torsoParts.filter((f) => !f.ok).map((f) => f.label);
+  hipsVisible = framingReport.find((f) => f.key === "hips")?.ok ?? false;
+  const missingTorso = torsoParts.filter((f) => !f.ok)
+    .map((f) => `${f.label} (${f.why})`);
   out.push({
-    key: "framing", label: "torso in frame", ok: torsoOk,
-    detail: torsoOk
-      ? (framingOk ? "full body visible" : "torso only — enough to drape")
-      : `missing: ${missingTorso.join(", ")}`,
+    key: "framing", label: "shoulders in frame", ok: torsoOk,
+    detail: !torsoOk ? `missing: ${missingTorso.join(", ")}`
+      : framingOk ? "full body visible"
+      : hipsVisible ? "torso only — enough to drape"
+      : "shoulders only — placement estimated from shoulder width",
   });
 
   // --- confidence ---
@@ -1066,10 +1079,27 @@ function pix(lm, out) { return out.set((0.5 - lm.x) * W, -(lm.y - 0.5) * H, 0); 
 function align(lms) {
   if (!twinTorsoMetres) return;
   _sh.copy(pix(lms[11], _p1)).add(pix(lms[12], _p2)).multiplyScalar(0.5);
-  _hp.copy(pix(lms[23], _p1)).add(pix(lms[24], _p2)).multiplyScalar(0.5);
-  const torsoPx = _sh.distanceTo(_hp);
-  if (torsoPx < 1) return;
-  const scale = torsoPx / twinTorsoMetres;   // metres → pixels, here and now
+
+  let torsoPx, scale;
+  if (hipsVisible) {
+    _hp.copy(pix(lms[23], _p1)).add(pix(lms[24], _p2)).multiplyScalar(0.5);
+    torsoPx = _sh.distanceTo(_hp);
+    if (torsoPx < 1) return;
+    scale = torsoPx / twinTorsoMetres;       // metres → pixels, here and now
+  } else {
+    // Hips below the frame. Shoulder WIDTH is still fully visible and is a
+    // rigid bony span, so it makes a better scale reference than anything
+    // inferred vertically. Torso length then follows from the twin's own
+    // shoulder-to-torso proportion rather than a population average — the
+    // model already encodes that ratio, so we may as well use its version.
+    const shoulderPx = pix(lms[11], _p1).distanceTo(pix(lms[12], _p2));
+    if (shoulderPx < 1 || !twinShoulderMetres) return;
+    scale = shoulderPx / twinShoulderMetres;
+    torsoPx = twinTorsoMetres * scale;
+    // Straight down the screen: correct for an upright seated person, and the
+    // error is plainly visible rather than hidden in a number.
+    _hp.set(_sh.x, _sh.y - torsoPx, 0);
+  }
 
   if (!haveAlign) { smoothScale = scale; smoothX = _hp.x; smoothY = _hp.y; haveAlign = true; }
   else {
