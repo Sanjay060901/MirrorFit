@@ -70,7 +70,7 @@ import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/
 import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
 import {
   createDevice, measureCapsules, poseCapsules, draftShirt,
-  GarmentSim, buildGarmentGeometry, makeGarmentMaterial, COLLISION_MARGIN, norm,
+  GarmentSim, buildGarmentGeometry, makeGarmentMaterial, loadPrint, COLLISION_MARGIN, norm,
 } from "../lib/cloth.js";
 
 // ============================================================================
@@ -158,6 +158,7 @@ const CAPSULE_SPEC = [
 let device = null, sim = null, skinned = null, twinModel = null, bodyMat = null;
 let garmentMesh = null, renderPos = null, capsuleGroup = null;
 let capsules = [], boneByName = new Map();
+let garmentPrint = null;
 let garmentColour = 0xc94f4f, ease = 0.030, res = 96;
 let armAngle = THREE.MathUtils.degToRad(38);
 
@@ -234,7 +235,7 @@ function drape() {
     if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
     const built = buildGarmentGeometry(drafted);
     renderPos = built.renderPos;
-    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour));
+    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour, { print: garmentPrint }));
     // Child of twinModel, so it inherits the mirror and the pixels-per-metre
     // scale through exactly the same transform chain the body uses.
     twinModel.add(garmentMesh);
@@ -278,7 +279,9 @@ $("redrape").addEventListener("click", drape);
 $("spin").addEventListener("change", (e) => { controls.autoRotate = e.target.checked; });
 document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
   garmentColour = parseInt(el.dataset.c, 16);
-  if (garmentMesh) garmentMesh.material.color.setHex(garmentColour);
+  // The colour is baked into the albedo canvas along with the ribbing and the
+  // print, so changing it means recompositing rather than setting .color.
+  garmentMesh?.material.userData.rebuild?.(garmentColour, garmentPrint);
 }));
 $("bodymode").addEventListener("change", (e) => setBodyMode(e.target.value));
 function setBodyMode(mode) {
@@ -377,6 +380,11 @@ function maybeCapture() {
     alignGroup.scale.set(-scale, scale, scale);   // negative x == the mirror
     alignGroup.position.set(0, -30, 0);
     alignGroup.updateWorldMatrix(true, true);
+
+    // Optional brand artwork. Drop any PNG at web/assets/garment-print.png and
+    // it is composited onto the chest. Absent, the shirt is plain — a missing
+    // print is a valid state, not an error.
+    garmentPrint = await loadPrint("../assets/garment-print.png");
 
     step = "capsules";
     capsules = measureCapsules(skinned, twinModel, CAPSULE_SPEC);

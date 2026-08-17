@@ -102,7 +102,7 @@ import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/
 import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 import {
   createDevice, measureCapsules, poseCapsules, draftShirt,
-  GarmentSim, buildGarmentGeometry, makeGarmentMaterial, norm,
+  GarmentSim, buildGarmentGeometry, makeGarmentMaterial, loadPrint, norm,
 } from "../lib/cloth.js";
 
 // ============================================================================
@@ -1120,6 +1120,7 @@ function align(lms) {
 // ---------------------------------------------------------------------------
 
 let device = null, sim = null, garmentMesh = null, renderPos = null;
+let garmentPrint = null;
 let garmentColour = 0xc94f4f;
 let ease = 0.030, res = 72;
 let trackedFrames = 0, autoDraped = false;
@@ -1166,7 +1167,7 @@ function drape() {
     if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
     const built = buildGarmentGeometry(drafted);
     renderPos = built.renderPos;
-    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour));
+    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour, { print: garmentPrint }));
     // Child of twinModel, so it inherits the hip offset, the metres→pixels
     // scale AND the mirror — exactly the same transform chain the body gets.
     twinModel.add(garmentMesh);
@@ -1230,7 +1231,9 @@ $("vop").addEventListener("input", (e) => { video.style.opacity = String(e.targe
 
 document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
   garmentColour = parseInt(el.dataset.c, 16);
-  if (garmentMesh) garmentMesh.material.color.setHex(garmentColour);
+  // The colour is baked into the albedo canvas along with the ribbing and the
+  // print, so changing it means recompositing rather than setting .color.
+  garmentMesh?.material.userData.rebuild?.(garmentColour, garmentPrint);
 }));
 
 $("bodymode").addEventListener("change", (e) => setBodyMode(e.target.value));
@@ -1605,6 +1608,11 @@ function loop() {
     device = await createDevice();
     device.lost.then((i) => { errEl.textContent = `GPU device lost: ${i.message || i.reason}`; });
     subsystems.gpu = true;
+
+    // Optional brand artwork. Drop any PNG at web/assets/garment-print.png and
+    // it is composited onto the chest. Absent, the shirt is plain — a missing
+    // print is a valid state, not an error.
+    garmentPrint = await loadPrint("../assets/garment-print.png");
 
     step = "camera";
     await startCamera();

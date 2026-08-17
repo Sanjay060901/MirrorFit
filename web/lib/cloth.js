@@ -1287,27 +1287,190 @@ export class GarmentSim {
  *    done in the vertex shader, so it costs nothing and never feeds back into
  *    the physics.
  */
-export function makeGarmentMaterial(colour = 0xc94f4f, thickness = 0.004) {
+// ---------------------------------------------------------------------------
+// Fabric appearance
+// ---------------------------------------------------------------------------
+//
+// A correct simulation still reads as a bag if the surface is one flat colour.
+// Three things do most of the work of making cloth look like cloth, and none
+// of them need an authored asset:
+//
+//   KNIT STRUCTURE  jersey is a grid of interlocking loops. At normal viewing
+//                   distance you don't resolve a loop, but you do see the
+//                   anisotropic micro-shading it produces — slightly stronger
+//                   vertically than horizontally. A normal map gets that.
+//   TONAL VARIATION dyed cotton is never uniform. A little low-frequency noise
+//                   in the albedo removes the "painted plastic" read instantly.
+//   SHEEN           fabric has a retroreflective lobe from the fibre nap that
+//                   metals and plastics do not. MeshPhysicalMaterial models it.
+
+function makeCanvas(size) {
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  return c;
+}
+
+// Jersey knit as a normal map. Columns of interlocking loops: a V shape
+// repeated, with the vertical rib stronger than the horizontal course, which
+// is what gives knit its directional sheen.
+function knitNormalMap(size = 512, loops = 64) {
+  const c = makeCanvas(size);
+  const ctx = c.getContext("2d");
+  const img = ctx.createImageData(size, size);
+  const step = size / loops;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = (x % step) / step - 0.5;      // across a loop
+      const v = (y % step) / step - 0.5;      // along a course
+      // A V-shaped loop: the surface tilts left on one half, right on the
+      // other, and dips between courses.
+      const nx = Math.sin(u * Math.PI * 2) * 0.55;
+      const ny = Math.sin(v * Math.PI * 2) * 0.30 + Math.cos(u * Math.PI * 4) * 0.12;
+      const nz = Math.sqrt(Math.max(1e-4, 1 - nx * nx - ny * ny));
+      const i = (y * size + x) * 4;
+      img.data[i] = (nx * 0.5 + 0.5) * 255;
+      img.data[i + 1] = (ny * 0.5 + 0.5) * 255;
+      img.data[i + 2] = nz * 255;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// Base colour, tonal variation, and — if supplied — a chest print composited
+// straight into the albedo.
+//
+// Compositing rather than a second texture and a shader mix: the print has to
+// land in one specific place on the UV layout, the layout is a plain
+// column/row grid, and a canvas draw expresses that in two lines. The cost is
+// rebuilding the canvas when the colour changes, which is once per click.
+function albedoMap(colour, print, size = 1024) {
+  const c = makeCanvas(size);
+  const ctx = c.getContext("2d");
+  const col = new THREE.Color(colour);
+  ctx.fillStyle = `#${col.getHexString()}`;
+  ctx.fillRect(0, 0, size, size);
+
+  // Low-frequency mottling: dye is never perfectly even.
+  ctx.globalAlpha = 0.055;
+  for (let i = 0; i < 900; i++) {
+    const r = 12 + Math.random() * 70;
+    ctx.fillStyle = Math.random() < 0.5 ? "#000" : "#fff";
+    ctx.beginPath();
+    ctx.arc(Math.random() * size, Math.random() * size, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // RIBBING at the collar and hem. On a real tee these are a separate, denser,
+  // doubled-over knit, and they read as darker with a fine vertical rib. v runs
+  // 1 at the neck to 0 at the hem, so the collar is the top sliver and the hem
+  // the bottom one. Getting these two bands right does more for "this is a
+  // t-shirt" than anything else on the surface — their absence is most of why
+  // the garment looked like a bag.
+  const band = (v0, v1) => {
+    const y0 = size * (1 - v1), y1 = size * (1 - v0);
+    ctx.save();
+    ctx.globalCompositeOperation = "multiply";
+    ctx.fillStyle = "rgba(0,0,0,0.16)";
+    ctx.fillRect(0, y0, size, y1 - y0);
+    // fine vertical rib
+    ctx.globalAlpha = 0.30;
+    ctx.fillStyle = "#000";
+    for (let x = 0; x < size; x += 6) ctx.fillRect(x, y0, 2, y1 - y0);
+    ctx.restore();
+  };
+  band(0.955, 1.0);     // collar
+  band(0.0, 0.035);     // hem band
+
+  // Shadow in the seam line where the sleeve meets the body, and down the
+  // sides. Ambient occlusion in a crease is a strong depth cue and the solver
+  // gives us none of it.
+  ctx.save();
+  ctx.globalCompositeOperation = "multiply";
+  const g = ctx.createLinearGradient(0, 0, size, 0);
+  for (const u of [0.0, 0.5, 1.0]) {          // the two side seams
+    g.addColorStop(Math.max(0, u - 0.02), "rgba(255,255,255,1)");
+    g.addColorStop(Math.min(1, u), "rgba(180,180,180,1)");
+    g.addColorStop(Math.min(1, u + 0.02), "rgba(255,255,255,1)");
+  }
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  ctx.restore();
+
+  if (print) {
+    // u wraps around the body starting at the wearer's left, so the FRONT of
+    // the chest is a quarter of the way round: u = 0.25. v runs 1 at the neck
+    // to 0 at the hem, so a chest print sits high.
+    const w = size * 0.20, h = w * (print.height / print.width || 1);
+    const cx = size * 0.25, cy = size * (1 - 0.62);
+    ctx.drawImage(print, cx - w / 2, cy - h / 2, w, h);
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/**
+ * Fabric material for a garment.
+ *
+ *  - OPAQUE and double-sided. Cloth is not glass, and the mirror's negative x
+ *    scale inverts winding, so single-sided fabric is culled into invisibility.
+ *  - A THICKNESS OFFSET in the vertex shader. The simulation treats the garment
+ *    as an infinitely thin surface, so where it rests exactly on the collision
+ *    surface the body wins pixels at random and mottles through. Displacing the
+ *    rendered surface along its normal gives apparent thickness, costs nothing,
+ *    and never feeds back into the physics.
+ */
+export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
+  const { thickness = 0.004, print = null, knitScale = 5 } = opts;
+  const normalMap = knitNormalMap();
+  normalMap.repeat.set(knitScale, knitScale * 1.4);   // courses denser than wales
+
   const mat = new THREE.MeshPhysicalMaterial({
-    color: colour,
-    roughness: 0.88,
+    map: albedoMap(colour, print),
+    normalMap,
+    normalScale: new THREE.Vector2(0.35, 0.35),
+    roughness: 0.92,
     metalness: 0.0,
-    sheen: 0.55,
-    sheenRoughness: 0.75,
+    sheen: 0.7,
+    sheenRoughness: 0.65,
     sheenColor: new THREE.Color(0xffffff),
     side: THREE.DoubleSide,
     transparent: false,
-    opacity: 1.0,
   });
+
   mat.userData.thickness = { value: thickness };
+  mat.userData.rebuild = (newColour, newPrint) => {
+    mat.map?.dispose();
+    mat.map = albedoMap(newColour ?? colour, newPrint ?? print);
+    mat.needsUpdate = true;
+  };
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uThickness = mat.userData.thickness;
     shader.vertexShader = shader.vertexShader
-      .replace("#include <common>", "#include <common>\nuniform float uThickness;")
+      .replace("#include <common>", "#include <common>
+uniform float uThickness;")
       .replace("#include <begin_vertex>",
-               "#include <begin_vertex>\ntransformed += normalize(objectNormal) * uThickness;");
+               "#include <begin_vertex>
+transformed += normalize(objectNormal) * uThickness;");
   };
   return mat;
+}
+
+/** Load an image for use as a garment print. Resolves to null if absent. */
+export function loadPrint(url) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);   // no print is a valid state
+    img.src = url;
+  });
 }
 
 /** Build the renderable mesh for a drafted garment. */
