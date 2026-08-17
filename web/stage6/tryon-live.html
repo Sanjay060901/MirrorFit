@@ -1167,7 +1167,7 @@ function drape() {
     if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
     const built = buildGarmentGeometry(drafted);
     renderPos = built.renderPos;
-    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour, { print: garmentPrint }));
+    garmentMesh = new THREE.Mesh(built.geometry, makeGarmentMaterial(garmentColour, { print: garmentPrint, geom: drafted.profile }));
     // Child of twinModel, so it inherits the hip offset, the metres→pixels
     // scale AND the mirror — exactly the same transform chain the body gets.
     twinModel.add(garmentMesh);

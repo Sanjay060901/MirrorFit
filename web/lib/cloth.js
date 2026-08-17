@@ -815,6 +815,10 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null }) {
     lengthRatio: (shoulderHeight - heightOf(bodyChain[bodyChain.length - 1].p)) / shoulderToHip,
     targetLengthRatio: TEE_LENGTH_RATIO,
     hemDrop: hemDropM,
+    // Real-world dimensions of the UV square, so artwork can be placed in
+    // centimetres rather than in fractions of a texture.
+    circumCm: ellipsePerimeter(chest.rx + ease, chest.rz + ease) * 100,
+    lengthCm: (heightOf(yokeChain[0].p) - heightOf(bodyChain[bodyChain.length - 1].p)) * 100,
     degraded,
     seam: { count: seam.count, maxRest: seam.maxRest,
             avgRest: seam.count ? seam.sumRest / seam.count : 0 },
@@ -1347,7 +1351,14 @@ function knitNormalMap(size = 512, loops = 64) {
 // land in one specific place on the UV layout, the layout is a plain
 // column/row grid, and a canvas draw expresses that in two lines. The cost is
 // rebuilding the canvas when the colour changes, which is once per click.
-function albedoMap(colour, print, size = 1024) {
+// Perimeter of an ellipse has no closed form; Ramanujan's second approximation
+// is accurate to about 1e-5 for the eccentricities a torso reaches.
+function ellipsePerimeter(a, b) {
+  const h = ((a - b) ** 2) / ((a + b) ** 2);
+  return Math.PI * (a + b) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
+}
+
+function albedoMap(colour, print, geom = null, size = 2048) {
   const c = makeCanvas(size);
   const ctx = c.getContext("2d");
   const col = new THREE.Color(colour);
@@ -1402,11 +1413,28 @@ function albedoMap(colour, print, size = 1024) {
   ctx.restore();
 
   if (print) {
-    // u wraps around the body starting at the wearer's left, so the FRONT of
-    // the chest is a quarter of the way round: u = 0.25. v runs 1 at the neck
-    // to 0 at the hem, so a chest print sits high.
-    const w = size * 0.20, h = w * (print.height / print.width || 1);
-    const cx = size * 0.25, cy = size * (1 - 0.62);
+    // PLACEMENT AND SIZE IN CENTIMETRES, not in fractions of the atlas.
+    //
+    // The UV grid is NOT isotropic. u spans the garment's circumference and v
+    // its neck-to-hem length, and on this body those are 96.1 cm and 68.1 cm —
+    // so a 2048 atlas is 21.3 px/cm across but 30.1 px/cm down. Sizing a print
+    // as "20% of the atlas" therefore stretched it horizontally by 1.4x, and a
+    // circular logo came out an ellipse.
+    //
+    // Converting through real dimensions fixes the aspect AND means artwork is
+    // specified the way a brand actually specifies it: "print is 25 cm wide,
+    // centred, 20 cm below the neck".
+    const circumCm = (geom?.circumCm ?? 96.1);
+    const lengthCm = (geom?.lengthCm ?? 68.1);
+    const wCm = print.widthCm ?? 25;
+    const hCm = wCm * (print.height / print.width || 1);
+
+    const w = size * (wCm / circumCm);
+    const h = size * (hCm / lengthCm);
+    // u = 0.25 is the front of the chest: u wraps from the wearer's LEFT, so a
+    // quarter turn lands centre-front.
+    const cx = size * (print.u ?? 0.25);
+    const cy = size * (1 - (print.v ?? 0.62));
     ctx.drawImage(print, cx - w / 2, cy - h / 2, w, h);
   }
 
@@ -1427,12 +1455,12 @@ function albedoMap(colour, print, size = 1024) {
  *    and never feeds back into the physics.
  */
 export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
-  const { thickness = 0.004, print = null, knitScale = 5 } = opts;
+  const { thickness = 0.004, print = null, knitScale = 5, geom = null } = opts;
   const normalMap = knitNormalMap();
   normalMap.repeat.set(knitScale, knitScale * 1.4);   // courses denser than wales
 
   const mat = new THREE.MeshPhysicalMaterial({
-    map: albedoMap(colour, print),
+    map: albedoMap(colour, print, opts.geom),
     normalMap,
     normalScale: new THREE.Vector2(0.35, 0.35),
     roughness: 0.92,
@@ -1447,7 +1475,7 @@ export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
   mat.userData.thickness = { value: thickness };
   mat.userData.rebuild = (newColour, newPrint) => {
     mat.map?.dispose();
-    mat.map = albedoMap(newColour ?? colour, newPrint ?? print);
+    mat.map = albedoMap(newColour ?? colour, newPrint ?? print, geom);
     mat.needsUpdate = true;
   };
   mat.onBeforeCompile = (shader) => {
@@ -1462,13 +1490,34 @@ transformed += normalize(objectNormal) * uThickness;");
   return mat;
 }
 
-/** Load an image for use as a garment print. Resolves to null if absent. */
-export function loadPrint(url) {
+/**
+ * Load artwork for use as a garment print.
+ *
+ * `opts` carries the placement a brand would specify on a spec sheet:
+ *   widthCm  printed width across the chest (default 25, a common chest print)
+ *   u        0.25 is centre-front; u wraps from the wearer's left
+ *   v        1 at the neck, 0 at the hem; 0.62 sits high on the chest
+ *
+ * Resolves to null when the file is absent — a plain shirt is a valid state,
+ * not an error.
+ */
+export function loadPrint(url, opts = {}) {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => resolve(null);   // no print is a valid state
+    img.onload = () => {
+      img.widthCm = opts.widthCm ?? 25;
+      img.u = opts.u ?? 0.25;
+      img.v = opts.v ?? 0.62;
+      if (img.naturalWidth < 512) {
+        // At 2048 atlas the garment resolves ~21 px/cm across, so a 25 cm print
+        // wants ~533 px. Below that it will visibly soften.
+        console.warn(`garment print is ${img.naturalWidth}px wide; ` +
+                     `at least 512px recommended for a ${img.widthCm} cm print`);
+      }
+      resolve(img);
+    };
+    img.onerror = () => resolve(null);
     img.src = url;
   });
 }
