@@ -179,36 +179,56 @@ export function measureCapsules(skinned, root, spec) {
     // upright pose here, so world x is the body's side and world z its front;
     // that is only true at bind time, which is exactly why we measure once and
     // then carry the numbers rather than re-deriving them live.
-    const radial = [], sideways = [], front = [], back = [];
+    // Gather every owned vertex once, with where it falls along the segment,
+    // then choose the sampling band afterwards.
+    const owned = [];
     for (let i = 0; i < posAttr.count; i++) {
       if (!prefixes.some((p) => owners[i].startsWith(p))) continue;
-
       sampleVertex(i, v);
       toLocal(v);
       ap.subVectors(v, a);
       const t = THREE.MathUtils.clamp(ap.dot(ab) / denom, 0, 1);
-      // Skip the ends: near a joint the neighbouring part bulges in and would
-      // overstate this segment's girth.
-      if (t < 0.15 || t > 0.85) continue;
-
       const closest = ab.clone().multiplyScalar(t).add(a);
-      const d = v.clone().sub(closest);
-      radial.push(d.length());
+      owned.push({ t, d: v.clone().sub(closest) });
+    }
 
-      // Measure each semi-axis only from vertices that actually lie near it.
-      // A percentile of |d.x| over ALL vertices mixes in the front and back of
-      // the torso, where |d.x| is near zero — which understates the width, and
-      // is how the chest once came out deeper than it was wide.
-      const ax = Math.abs(d.x), az = Math.abs(d.z);
-      if (ax > az * 2.0) sideways.push(ax);
-      if (az > ax * 2.0) { if (d.z > 0) front.push(d.z); else back.push(-d.z); }
+    // Trimming the ends stops a neighbouring part's bulge inflating this
+    // segment's girth — but a fixed 15% trim assumes the bone spans the body
+    // part. For a SHORT bone it need not: neck01 -> head is mostly skull, so
+    // the neck's own vertices all landed outside [0.15, 0.85] and the capsule
+    // silently fell back to 0.35 x segment length. Measured against the mesh
+    // that gave 0.036 where the truth is 0.043.
+    //
+    // So widen the band until there is enough to measure, and only give up
+    // when even the whole segment yields nothing.
+    const BANDS = [[0.15, 0.85], [0.05, 0.95], [0.0, 1.0]];
+    let radial = [], sideways = [], front = [], back = [], usedBand = null;
+    for (const [lo, hi] of BANDS) {
+      radial = []; sideways = []; front = []; back = [];
+      for (const o of owned) {
+        if (o.t < lo || o.t > hi) continue;
+        radial.push(o.d.length());
+        // Measure each semi-axis only from vertices that actually lie near it.
+        // A percentile of |d.x| over ALL vertices mixes in the front and back
+        // of the torso, where |d.x| is near zero — which understates the width,
+        // and is how the chest once came out deeper than it was wide.
+        const ax = Math.abs(o.d.x), az = Math.abs(o.d.z);
+        if (ax > az * 2.0) sideways.push(ax);
+        if (az > ax * 2.0) { if (o.d.z > 0) front.push(o.d.z); else back.push(-o.d.z); }
+      }
+      if (radial.length >= 8) { usedBand = [lo, hi]; break; }
+    }
+    if (usedBand && usedBand[0] !== 0.15) {
+      console.warn(`capsule ${s.label}: widened sampling band to ` +
+                   `[${usedBand[0]}, ${usedBand[1]}] to find ${radial.length} vertices`);
     }
 
     const clamp = (r) => Math.max(r, MIN_RADIUS);
     if (radial.length < 8) {
-      console.warn(`capsule ${s.label}: only ${radial.length} owned vertices`);
+      console.warn(`capsule ${s.label}: only ${owned.length} owned vertices, ` +
+                   `falling back to segment length — RADIUS IS A GUESS`);
       const r = clamp(ab.length() * 0.35);
-      out.push({ ...s, aBones, bBones, rx: r, rz: r, dz: 0 });
+      out.push({ ...s, aBones, bBones, rx: r, rz: r, dz: 0, degraded: true });
       continue;
     }
 

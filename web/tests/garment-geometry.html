@@ -13,6 +13,11 @@ import { measureCapsules, poseCapsules, draftShirt, buildGarmentGeometry, norm }
   from "../lib/cloth.js";
 
 const log = [];
+// Fallbacks that change results must be visible, not buried in a console
+// nobody is watching. Capture them and fail the run on them.
+const warnings = [];
+const _warn = console.warn;
+console.warn = (...a) => { warnings.push(a.join(" ")); _warn(...a); };
 const say = (s) => { log.push(s); document.getElementById("o").textContent = log.join("\n"); };
 
 const SPEC = [
@@ -60,7 +65,7 @@ try {
   // part it claims to.
   const EXPECT = {
     chestUpper: [0.161, 0.082], chest: [0.146, 0.095], waist: [0.128, 0.086],
-    hips: [0.146, 0.094], neck: [0.036, 0.036],
+    hips: [0.146, 0.094],   // neck asserted separately, see below
     shoulderL: [0.072, 0.072], shoulderR: [0.072, 0.072],
     armL: [0.078, 0.078], armR: [0.078, 0.078],
     forearmL: [0.064, 0.064], forearmR: [0.064, 0.064],
@@ -78,7 +83,50 @@ try {
         `dz=${c.dz.toFixed(3)}   expect ${e ? e.join("/") : "?"}` +
         `${bad ? `   <<< OFF BY ${off.toFixed(3)} m` : "   ok"}`);
   }
-  say(fails ? `${fails} CAPSULE(S) FAILED` : "all capsules within 20 mm of the mesh");
+  say(fails ? `${fails} CAPSULE(S) FAILED` : "all measured capsules within 20 mm of the mesh");
+
+  // NECK, measured straight off the mesh rather than trusted from the capsule.
+  // The expectation used to be 0.036 — which was this test's own earlier output,
+  // and that output was a FALLBACK (segment length x 0.35), not a measurement.
+  // Asserting against yourself only detects change, never correctness.
+  {
+    const byN = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));
+    const neckY = root.worldToLocal(byN.get(norm("neck01"))
+      .getWorldPosition(new THREE.Vector3())).y;
+    const pa = skinned.geometry.attributes.position;
+    const si = skinned.geometry.attributes.skinIndex;
+    const sw = skinned.geometry.attributes.skinWeight;
+    const names = skinned.skeleton.bones.map((b) => norm(b.name));
+    const v = new THREE.Vector3();
+    const rr = [];
+    for (let i = 0; i < pa.count; i++) {
+      let best = 0, bw = -1;
+      for (let j = 0; j < 4; j++) {
+        const w = sw.getComponent(i, j);
+        if (w > bw) { bw = w; best = si.getComponent(i, j); }
+      }
+      if (!/^neck/.test(names[best] ?? "")) continue;
+      v.fromBufferAttribute(pa, i).applyMatrix4(skinned.matrixWorld);
+      root.worldToLocal(v);
+      if (Math.abs(v.y - (neckY + 0.03)) > 0.02) continue;   // a band up the neck
+      rr.push(Math.hypot(v.x, v.z));
+    }
+    rr.sort((a, b) => a - b);
+    const truth = rr.length ? rr[Math.floor(rr.length * 0.95)] : null;
+    const cap = caps.find((c) => c.label === "neck");
+    const off = truth != null ? Math.abs(cap.rx - truth) : null;
+    say(`  neck        rx=${cap.rx.toFixed(3)}   mesh says ${truth == null ? "?" : truth.toFixed(3)}` +
+        ` (${rr.length} verts)${off != null && off > 0.02 ? `   <<< OFF BY ${off.toFixed(3)} m` : "   ok"}`);
+    if (off != null && off > 0.02) fails++;
+  }
+
+  if (warnings.length) {
+    say(`
+${warnings.length} SILENT FALLBACK(S) — each one changed a result:`);
+    for (const w of warnings) say("  " + w);
+  } else {
+    say("no fallbacks taken");
+  }
 
   // Body frame from bone positions, exactly as the live page derives it.
   const byName = new Map(skinned.skeleton.bones.map((b) => [norm(b.name), b]));

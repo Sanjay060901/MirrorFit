@@ -880,17 +880,24 @@ const POSE_GRACE_FRAMES = 8;     // brief dropouts shouldn't strip the garment
 const FIT_CLAMP_EPS = 0.97;      // |param| above this counts as saturated
 const FIT_MAX_RESIDUAL = 0.09;   // relative; above this the fit didn't converge
 
-// What must be inside the frame before a full-body fit is even attempted.
-// Legs matter far more than they look: thigh and shin carry the largest
-// Jacobian entries for `height`, so cropping them is precisely what drives
-// that parameter into its clamp.
+// Framing has TWO tiers, and conflating them is what hid the working garment.
+//
+// To DRAPE a shirt we need the torso: shoulders and hips, nothing else. To FIT
+// body shape we need the whole body, because thigh and shin carry the largest
+// Jacobian entries for `height` — cropping them is precisely what drives that
+// parameter into its clamp.
+//
+// Requiring the second for the first meant someone sitting at a desk, whose
+// torso is tracked perfectly, was shown nothing at all. Same mistake as
+// blocking the garment on the shape fit, one layer up.
 const FRAME_REQUIRED = [
-  { key: "head",      idx: [0],       label: "head" },
-  { key: "shoulders", idx: [11, 12],  label: "shoulders" },
-  { key: "hips",      idx: [23, 24],  label: "hips" },
-  { key: "knees",     idx: [25, 26],  label: "knees" },
-  { key: "ankles",    idx: [27, 28],  label: "ankles" },
+  { key: "shoulders", idx: [11, 12], label: "shoulders", tier: "garment" },
+  { key: "hips",      idx: [23, 24], label: "hips",      tier: "garment" },
+  { key: "head",      idx: [0],      label: "head",      tier: "fit" },
+  { key: "knees",     idx: [25, 26], label: "knees",     tier: "fit" },
+  { key: "ankles",    idx: [27, 28], label: "ankles",    tier: "fit" },
 ];
+let fullBodyFramed = false;
 
 let framesSincePose = 9999;
 let fitState = "waiting";        // waiting|collecting|insufficient|saturated|singular|ok
@@ -931,10 +938,15 @@ function evaluateGates(imageLms, rawLms) {
   } else {
     for (const part of FRAME_REQUIRED) framingReport.push({ ...part, ok: false, why: "no pose" });
   }
-  const missing = framingReport.filter((f) => !f.ok).map((f) => f.label);
+  fullBodyFramed = framingOk;
+  const torsoParts = framingReport.filter((f) => f.tier === "garment");
+  const torsoOk = torsoParts.every((f) => f.ok);
+  const missingTorso = torsoParts.filter((f) => !f.ok).map((f) => f.label);
   out.push({
-    key: "framing", label: "full body in frame", ok: framingOk,
-    detail: framingOk ? "all landmarks clear" : `missing: ${missing.join(", ")}`,
+    key: "framing", label: "torso in frame", ok: torsoOk,
+    detail: torsoOk
+      ? (framingOk ? "full body visible" : "torso only — enough to drape")
+      : `missing: ${missingTorso.join(", ")}`,
   });
 
   // --- confidence ---
@@ -965,12 +977,17 @@ function evaluateGates(imageLms, rawLms) {
   // garment drapes on the NEUTRAL body and every fit-derived claim is labelled
   // unpersonalised, so nothing on screen implies accuracy we do not have.
   const fitOk = fitState === "ok" || !fitData;
+  const legsMissing = framingReport.filter((f) => f.tier === "fit" && !f.ok)
+    .map((f) => f.label);
   out.push({
     key: "fit", label: "shape fit converged",
     ok: fitOk || allowNeutral,
     detail: !fitData ? "no bodyfit.json — neutral body"
       : fitOk ? fitDetail
-      : `${fitDetail} — SHOWING AVERAGE BUILD, size not personalised`,
+      : legsMissing.length
+        ? `needs ${legsMissing.join(", ")} in frame` +
+          (allowNeutral ? " — using average build" : "")
+      : `${fitDetail}${allowNeutral ? " — using average build" : ""}`,
   });
 
   return out;
@@ -1232,8 +1249,11 @@ function drawCoach(imageLms) {
   dotsCtx.font = "600 12px ui-monospace, Consolas, monospace";
   let ty = y0 + 16;
   for (const f of framingReport) {
-    dotsCtx.fillStyle = f.ok ? "#6de08a" : "#ff9c5c";
-    dotsCtx.fillText(`${f.ok ? "\u2713" : "\u2717"} ${f.label}`, x0 + 8, ty);
+    // Amber, not red, for the fit-only requirements: missing legs costs you a
+    // personalised size, not the try-on itself.
+    dotsCtx.fillStyle = f.ok ? "#6de08a" : (f.tier === "garment" ? "#ff6b6b" : "#ffb347");
+    dotsCtx.fillText(`${f.ok ? "\u2713" : "\u2717"} ${f.label}` +
+                     (f.tier === "fit" && !f.ok ? "  (size only)" : ""), x0 + 8, ty);
     ty += 16;
   }
 
@@ -1246,8 +1266,10 @@ function drawCoach(imageLms) {
     const missing = framingReport.filter((f) => !f.ok);
     const torsoPx = Math.abs(((imageLms[23].y + imageLms[24].y) / 2 -
                               (imageLms[11].y + imageLms[12].y) / 2) * H);
-    if (missing.some((m) => m.key === "ankles" || m.key === "knees")) {
-      hint = "step back so your legs are in frame";
+    if (missing.some((m) => m.tier === "garment")) {
+      hint = "turn to face the camera, shoulders and hips in view";
+    } else if (missing.some((m) => m.key === "ankles" || m.key === "knees")) {
+      hint = "step back so your legs are in frame for a personalised size";
     } else if (missing.some((m) => m.key === "head")) {
       hint = "step back or tilt the camera up";
     } else if (torsoPx < H * 0.16) {
@@ -1421,7 +1443,6 @@ function loop() {
     // Gates are evaluated BEFORE anything consumes the landmarks, so no stage
     // can act on input that has already been judged unusable.
     gates = evaluateGates(lastImageLms, lastRawLms);
-    const framingOk = gates.find((g) => g.key === "framing").ok;
     const confOk = gates.find((g) => g.key === "confidence").ok;
     ready = gates.every((g) => g.ok);
 
@@ -1435,7 +1456,7 @@ function loop() {
       // drove that parameter to its clamp. Sampling a badly framed body and
       // then regularising the result is not robustness, it is laundering.
       if (fitData && !fitApplied && skinned) {
-        if (framingOk && confOk) {
+        if (fullBodyFramed && confOk) {
           const sample = measurePerson(sw, res2.worldLandmarks[0]);
           const mask = res2.segmentationMasks?.[0];
           if (mask && sample.torso) {
