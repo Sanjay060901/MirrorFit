@@ -1,0 +1,78 @@
+<!DOCTYPE html><meta charset="utf-8">
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<body><pre id="o">running…</pre>
+<script type="module">
+// Does the fit engine produce a sane size chart from the measured body?
+// No camera, no GPU, no shape fitting — it reads the collision capsules only.
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { measureCapsules, poseCapsules, draftShirt, norm } from "../lib/cloth.js";
+import { GARMENTS, SIZES, easeFor, patternFor, fitReport, recommendSize } from "../lib/garments.js";
+
+const L=[]; const say=s=>{L.push(s);document.getElementById("o").textContent=L.join("\n");};
+const SPEC = [
+  { label:"chestUpper", a:"spine01", b:"neck01", owners:["spine01","breast"], elliptical:true },
+  { label:"chest", a:"spine03", b:"spine01", owners:["spine02","spine03","breast"], elliptical:true },
+  { label:"waist", a:"spine04", b:"spine03", owners:["spine03","spine04"], elliptical:true },
+  { label:"hips", a:["upperleg01.L","upperleg01.R"], b:"spine04", owners:["pelvis","spine04"], elliptical:true },
+  { label:"shoulderL", a:"clavicle.L", b:"upperarm01.L", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"shoulderR", a:"clavicle.R", b:"upperarm01.R", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"armL", a:"upperarm01.L", b:"lowerarm01.L", owners:["upperarm01.L","upperarm02.L"], elliptical:false },
+  { label:"armR", a:"upperarm01.R", b:"lowerarm01.R", owners:["upperarm01.R","upperarm02.R"], elliptical:false },
+  { label:"forearmL", a:"lowerarm01.L", b:"wrist.L", owners:["lowerarm01.L","lowerarm02.L"], elliptical:false },
+  { label:"forearmR", a:"lowerarm01.R", b:"wrist.R", owners:["lowerarm01.R","lowerarm02.R"], elliptical:false },
+  { label:"neck", a:"neck01", b:"head", owners:["neck"], elliptical:false },
+];
+try {
+  const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+  let sk=null; gltf.scene.traverse(o=>{if(o.isSkinnedMesh)sk=o;});
+  const root = gltf.scene;
+  const align = new THREE.Group(); align.add(root);
+  align.scale.set(-279,279,279);          // the live page's chain
+  const caps = measureCapsules(sk, root, SPEC);
+  const byName = new Map(sk.skeleton.bones.map(b=>[norm(b.name),b]));
+  const P = n => root.worldToLocal(byName.get(norm(n)).getWorldPosition(new THREE.Vector3()));
+  const left = P("upperarm01.L").sub(P("upperarm01.R")).normalize();
+  const up = P("upperarm01.L").add(P("upperarm01.R")).multiplyScalar(0.5)
+    .sub(P("upperleg01.L").add(P("upperleg01.R")).multiplyScalar(0.5)).normalize();
+  const front = new THREE.Vector3().crossVectors(left,up).normalize();
+  up.crossVectors(front,left).normalize();
+  poseCapsules(caps, root, {left,up,front}, 0);
+
+  const chest = caps.find(c=>c.label==="chest");
+  say(`MEASURED BODY (from the mesh, no shape fitting)`);
+  for (const k of ["chest","waist","hips"]) {
+    const c = caps.find(x=>x.label===k);
+    const r = fitReport(caps, 0).zones.find(z=>z.key===k);
+    say(`  ${k.padEnd(6)} ${r.bodyCm.toFixed(1)} cm circumference`);
+  }
+
+  say(`\nSIZE CHART — crew tee (ease in cm of chest circumference)`);
+  say(`  size   ease    verdict`);
+  for (const size of SIZES) {
+    const r = fitReport(caps, easeFor(GARMENTS.tee, size));
+    const z = r.zones.find(x=>x.key==="chest");
+    say(`  ${size.padEnd(5)} ${z.easeCm.toFixed(1).padStart(6)}   ${z.verdict}`);
+  }
+  const rec = recommendSize(caps, "tee");
+  say(`  -> recommends ${rec.size} (${rec.easeCm.toFixed(1)} cm ease)`);
+  const monotonic = SIZES.map(s=>fitReport(caps, easeFor(GARMENTS.tee,s)).zones.find(z=>z.key==="chest").easeCm);
+  const ok = monotonic.every((v,i)=>i===0||v>monotonic[i-1]);
+  say(`  ease increases with size: ${ok ? "yes" : "NO <<< BROKEN"}`);
+
+  say(`\nEVERY GARMENT TYPE drafts without error`);
+  for (const id of Object.keys(GARMENTS)) {
+    const pat = patternFor(id, "M");
+    const g = draftShirt({ caps, res: 44, ease: pat.ease,
+      neckCircum: pat.neckCircum, sleeveLength: pat.sleeveLength,
+      lengthRatio: pat.lengthRatio });
+    let nan=0;
+    for (let i=0;i<g.N;i++) if(!isFinite(g.pos[i*4])) nan++;
+    const rec2 = recommendSize(caps, id);
+    say(`  ${GARMENTS[id].name.padEnd(15)} ${String(g.N).padStart(5)} particles, ` +
+        `len ${g.profile.garmentLength*100 | 0} cm, neck ${(g.profile.neckCircum*100).toFixed(0)} cm, ` +
+        `size ${rec2.size}${nan?"   <<< NaN":""}`);
+  }
+  say("\nDONE");
+} catch(e) { say("FAILED: "+e.message+"\n"+(e.stack||"").split("\n").slice(0,3).join("\n")); }
+</script>

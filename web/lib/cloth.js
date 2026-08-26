@@ -327,7 +327,9 @@ export function capsuleByLabel(caps) {
  * hip radii. Two armholes are cut in it, and the sleeves are separate tubes
  * sewn to the armhole rims.
  */
-export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null }) {
+export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
+                             neckCircum = 0.42, sleeveLength = 0.34,
+                             lengthRatio = 1.37 }) {
   const m = capsuleByLabel(caps);
   const chest = m.get("chest"), waist = m.get("waist"), hips = m.get("hips");
   const neck = m.get("neck"), shL = m.get("shoulderL"), shR = m.get("shoulderR");
@@ -366,7 +368,7 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null }) {
   // whose shoulder-to-hip-joint is ~52 cm — a ratio of about 1.37. Applying
   // the ratio rather than the absolute length is what makes it grade with the
   // wearer instead of being right for one body only.
-  const TEE_LENGTH_RATIO = 1.37;
+  const TEE_LENGTH_RATIO = lengthRatio;
 
   // The neck opening has to clear the neck's COLLISION radius, not its
   // measured radius. Cut to the raw measurement, the hole is smaller than the
@@ -379,7 +381,7 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null }) {
   // previous +0.022 slack gave 47.8 cm, noticeably wider than any real tee,
   // which let the whole garment drop through. Clamped, not just computed, so a
   // thick-necked body still gets an opening it can physically wear.
-  const NECK_CIRCUM_TARGET = 0.42;
+  const NECK_CIRCUM_TARGET = neckCircum;
   const neckFloor = neck.rx + COLLISION_MARGIN + 0.004;   // must clear the neck
   const neckR = Math.max(neckFloor, NECK_CIRCUM_TARGET / (2 * Math.PI));
 
@@ -610,7 +612,7 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null }) {
     const u = new THREE.Vector3().crossVectors(axis, alt).normalize();
     const v2 = new THREE.Vector3().crossVectors(axis, u).normalize();
     const rad = arm.rx + COLLISION_MARGIN + ease;
-    const len = 0.34;                   // short sleeve: a third down the arm
+    const len = sleeveLength;           // fraction of the upper arm covered
 
     // THE SLEEVE HEAD IS THE ARMHOLE.
     //
@@ -1353,7 +1355,7 @@ function knitNormalMap(size = 512, loops = 64) {
 // rebuilding the canvas when the colour changes, which is once per click.
 // Perimeter of an ellipse has no closed form; Ramanujan's second approximation
 // is accurate to about 1e-5 for the eccentricities a torso reaches.
-function ellipsePerimeter(a, b) {
+export function ellipsePerimeter(a, b) {
   const h = ((a - b) ** 2) / ((a + b) ** 2);
   return Math.PI * (a + b) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
 }
