@@ -1480,12 +1480,16 @@ export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
   };
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uThickness = mat.userData.thickness;
+    // Backtick templates, not "..." with escapes: the newline matters to GLSL
+    // and an escaped \n inside a quoted string is exactly what broke this file
+    // once already.
     shader.vertexShader = shader.vertexShader
-      .replace("#include <common>", "#include <common>
-uniform float uThickness;")
+      .replace("#include <common>",
+               `#include <common>
+                uniform float uThickness;`)
       .replace("#include <begin_vertex>",
-               "#include <begin_vertex>
-transformed += normalize(objectNormal) * uThickness;");
+               `#include <begin_vertex>
+                transformed += normalize(objectNormal) * uThickness;`);
   };
   return mat;
 }
