@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>MirrorFit — trial room</title>
+<style>
+  /* ---------------------------------------------------------------------
+     Built portrait-first because a smart mirror IS portrait — a 1080x1920
+     panel behind half-silvered glass. Everything here is sized for that
+     panel and for touch: nothing smaller than 48 px, nothing that needs a
+     cursor, no hover-only affordances.
+     On a laptop the same layout just letterboxes, which is why this page is
+     usable at a desk without a second build.
+     --------------------------------------------------------------------- */
+  :root {
+    --bg:      #07090c;
+    --panel:   rgba(14,18,24,.82);
+    --edge:    rgba(255,255,255,.10);
+    --ink:     #f2f5f7;
+    --ink-dim: #93a2ad;
+    --accent:  #5ad1c8;
+    --ok:      #63d69a;
+    --warn:    #f0b352;
+    --bad:     #f0776b;
+    --touch:   52px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 400 15px/1.5 ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+    display: grid; place-items: center; overflow: hidden;
+  }
+
+  /* The mirror itself: locked to 9:16 and scaled to whatever glass it lands on */
+  #mirror {
+    position: relative; aspect-ratio: 9 / 16; height: 100vh; max-width: 100vw;
+    background: #000; overflow: hidden;
+    box-shadow: 0 0 0 1px var(--edge), 0 40px 120px -40px #000;
+  }
+  #video, #stage, #coach {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover;               /* video and canvas crop identically */
+  }
+  #video { transform: scaleX(-1); }
+
+  /* --------------------------------------------------------------- states */
+  .screen { position: absolute; inset: 0; display: grid; place-items: center;
+            text-align: center; padding: 40px; gap: 18px; align-content: center;
+            background: radial-gradient(120% 70% at 50% 40%, rgba(8,10,14,.55), rgba(4,6,9,.95));
+            transition: opacity .45s ease; }
+  .screen[hidden] { display: none; }
+  .screen h1 { margin: 0; font-size: 40px; font-weight: 300; letter-spacing: -.02em; }
+  .screen p  { margin: 0; color: var(--ink-dim); max-width: 26ch; }
+  .pulse { width: 84px; height: 84px; border-radius: 50%; border: 2px solid var(--accent);
+           display: grid; place-items: center; color: var(--accent); font-size: 30px;
+           animation: breathe 2.6s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { transform: scale(1); opacity: .75; }
+                       50%     { transform: scale(1.07); opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+  /* ------------------------------------------------------------- fit card */
+  #fitcard {
+    position: absolute; left: 16px; right: 16px; top: 16px;
+    background: var(--panel); backdrop-filter: blur(14px);
+    border: 1px solid var(--edge); border-radius: 14px; padding: 14px 16px;
+    display: grid; gap: 10px;
+  }
+  #fitcard[hidden] { display: none; }
+  .fitrow { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .verdict { font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+  .verdict.ok { color: var(--ok); } .verdict.warn { color: var(--warn); }
+  .verdict.bad { color: var(--bad); }
+  .rec { font: 600 12px/1 ui-monospace, Consolas, monospace; letter-spacing: .1em;
+         text-transform: uppercase; color: var(--accent); }
+  .zones { display: grid; gap: 7px; }
+  .zone { display: grid; grid-template-columns: 44px 1fr 68px; gap: 10px;
+          align-items: center; font-size: 12px; color: var(--ink-dim); }
+  .bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.10);
+         position: relative; overflow: hidden; }
+  .bar i { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 3px;
+           background: var(--accent); transition: width .3s ease; }
+  .zone b { font-variant-numeric: tabular-nums; text-align: right;
+            font-weight: 500; color: var(--ink); }
+
+  /* --------------------------------------------------------------- picker */
+  #picker {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    background: linear-gradient(to top, rgba(4,6,9,.96) 55%, transparent);
+    padding: 40px 12px 16px; display: grid; gap: 12px;
+  }
+  .styles { display: flex; gap: 8px; overflow-x: auto; padding: 2px;
+            scrollbar-width: none; }
+  .styles::-webkit-scrollbar { display: none; }
+  .style {
+    flex: 0 0 auto; min-width: 108px; min-height: var(--touch);
+    padding: 10px 14px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,.05); border: 1px solid var(--edge);
+    display: grid; gap: 2px; text-align: left; color: var(--ink);
+    font: inherit; transition: background .18s, border-color .18s;
+  }
+  .style strong { font-size: 13.5px; font-weight: 600; }
+  .style span   { font-size: 11px; color: var(--ink-dim); }
+  .style[aria-pressed="true"] { background: rgba(90,209,200,.14);
+                                border-color: var(--accent); }
+  .style:focus-visible, .size:focus-visible, .sw:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .sizes { display: flex; gap: 6px; flex: 1; }
+  .size {
+    flex: 1; min-width: 44px; min-height: 44px; border-radius: 10px;
+    background: rgba(255,255,255,.05); border: 1px solid var(--edge);
+    color: var(--ink); font: 600 13px/1 ui-monospace, Consolas, monospace;
+    cursor: pointer; position: relative; transition: background .18s, border-color .18s;
+  }
+  .size[aria-pressed="true"] { background: var(--accent); border-color: var(--accent);
+                               color: #06231f; }
+  .size[data-rec="1"]::after { content: ""; position: absolute; top: 5px; right: 5px;
+                               width: 5px; height: 5px; border-radius: 50%;
+                               background: var(--accent); }
+  .size[aria-pressed="true"][data-rec="1"]::after { background: #06231f; }
+  .sw { width: 34px; height: 34px; border-radius: 50%; border: 2px solid transparent;
+        cursor: pointer; padding: 0; }
+  .sw[aria-pressed="true"] { border-color: var(--ink); }
+
+  #hint { position: absolute; left: 0; right: 0; bottom: 190px; text-align: center;
+          font-size: 15px; color: var(--warn); text-shadow: 0 2px 12px #000;
+          pointer-events: none; }
+  #hint[hidden] { display: none; }
+  #err { position: absolute; left: 16px; right: 16px; bottom: 200px;
+         color: var(--bad); font-size: 13px; text-align: center; }
+  #dev { position: absolute; top: 8px; right: 12px; font: 400 10px/1.4 ui-monospace,
+         Consolas, monospace; color: rgba(255,255,255,.35); text-align: right;
+         pointer-events: none; white-space: pre; }
+</style>
+</head>
+<body>
+
+<div id="mirror">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="stage" width="640" height="480"></canvas>
+  <canvas id="coach" width="640" height="480"></canvas>
+  <div id="dev"></div>
+
+  <!-- attract loop: what the mirror shows when nobody is standing there -->
+  <div class="screen" id="idle">
+    <div class="pulse">◎</div>
+    <h1>Step in to try on</h1>
+    <p>Stand about two metres back so your shoulders are in frame.</p>
+  </div>
+
+  <div id="hint" hidden></div>
+  <div id="err"></div>
+
+  <div id="fitcard" hidden>
+    <div class="fitrow">
+      <span class="verdict" id="verdict">—</span>
+      <span class="rec" id="rec"></span>
+    </div>
+    <div class="zones" id="zones"></div>
+  </div>
+
+  <div id="picker">
+    <div class="styles" id="styles" role="group" aria-label="Garment style"></div>
+    <div class="row">
+      <div class="sizes" id="sizes" role="group" aria-label="Size"></div>
+      <div class="row" id="swatches" role="group" aria-label="Colour"></div>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import {
+  createDevice, measureCapsules, poseCapsules, draftShirt, GarmentSim,
+  buildGarmentGeometry, makeGarmentMaterial, loadPrint, norm,
+} from "../lib/cloth.js";
+import { GARMENTS, SIZES, patternFor, fitReport, recommendSize } from "../lib/garments.js";
+
+// ===========================================================================
+// MirrorFit trial room
+//
+// The same engine as the stage pages, wrapped in the experience a shopper
+// actually meets. Two things drive every decision here:
+//
+//   IT IS A MIRROR, NOT A WEBSITE. Portrait, touch, no cursor, no hover-only
+//   affordances, and an attract state for when nobody is standing there.
+//
+//   THE FIT NUMBER IS HONEST. It compares the drafted garment against the
+//   MEASURED collision capsules, which agree with the body mesh to within
+//   5 mm. It does not use shape fitting, which does not converge on frontal
+//   RGB. Nothing on this screen claims accuracy the sensor cannot support.
+// ===========================================================================
+
+const W = 640, H = 480;
+const $ = (id) => document.getElementById(id);
+const video = $("video"), errEl = $("err"), devEl = $("dev");
+
+// ---------------------------------------------------------------- state ----
+let style = "tee", size = "M", colour = 0xc94f4f;
+let recommended = null, needsRedraft = true;
+
+const COLOURS = [
+  ["#c94f4f", 0xc94f4f], ["#2f5f8f", 0x2f5f8f], ["#e8e4dc", 0xe8e4dc],
+  ["#2b2b30", 0x2b2b30], ["#4d7a52", 0x4d7a52], ["#b8823a", 0xb8823a],
+];
+
+// ------------------------------------------------------------------ ui -----
+function buildPicker() {
+  $("styles").innerHTML = Object.values(GARMENTS).map((g) =>
+    `<button class="style" data-id="${g.id}" aria-pressed="${g.id === style}">
+       <strong>${g.name}</strong><span>${g.blurb}</span></button>`).join("");
+  $("sizes").innerHTML = SIZES.map((s) =>
+    `<button class="size" data-size="${s}" aria-pressed="${s === size}">${s}</button>`).join("");
+  $("swatches").innerHTML = COLOURS.map(([hex, v]) =>
+    `<button class="sw" data-c="${v}" style="background:${hex}"
+       aria-pressed="${v === colour}" aria-label="${hex}"></button>`).join("");
+
+  $("styles").onclick = (e) => {
+    const b = e.target.closest(".style"); if (!b) return;
+    style = b.dataset.id; needsRedraft = true; syncPicker();
+  };
+  $("sizes").onclick = (e) => {
+    const b = e.target.closest(".size"); if (!b) return;
+    size = b.dataset.size; needsRedraft = true; syncPicker();
+  };
+  $("swatches").onclick = (e) => {
+    const b = e.target.closest(".sw"); if (!b) return;
+    colour = Number(b.dataset.c);
+    garmentMesh?.material.userData.rebuild?.(colour, garmentPrint);
+    syncPicker();
+  };
+}
+function syncPicker() {
+  for (const b of $("styles").children) b.setAttribute("aria-pressed", b.dataset.id === style);
+  for (const b of $("sizes").children) {
+    b.setAttribute("aria-pressed", b.dataset.size === size);
+    b.dataset.rec = b.dataset.size === recommended ? "1" : "0";
+  }
+  for (const b of $("swatches").children)
+    b.setAttribute("aria-pressed", Number(b.dataset.c) === colour);
+}
+
+const VERDICT_CLASS = {
+  "too tight": "bad", tight: "warn", "true to size": "ok",
+  loose: "warn", "too loose": "bad",
+};
+
+function showFit() {
+  if (!capsules.length) return;
+  const pat = patternFor(style, size);
+  const r = fitReport(capsules, pat.ease);
+  recommended = recommendSize(capsules, style)?.size ?? null;
+
+  $("verdict").textContent = r.verdict;
+  $("verdict").className = "verdict " + (VERDICT_CLASS[r.verdict] ?? "");
+  $("rec").textContent = recommended
+    ? (recommended === size ? "your size" : `we suggest ${recommended}`) : "";
+
+  // Ease drawn against the wearable range, so the bar reads as "where in the
+  // fit window does this sit" rather than as a raw number.
+  $("zones").innerHTML = r.zones.map((z) => {
+    const pct = Math.max(0, Math.min(100, ((z.easeCm + 4) / 30) * 100));
+    return `<div class="zone"><span>${z.label}</span>
+      <span class="bar"><i style="width:${pct}%"></i></span>
+      <b>${z.easeCm >= 0 ? "+" : ""}${z.easeCm.toFixed(1)} cm</b></div>`;
+  }).join("");
+  $("fitcard").hidden = false;
+  syncPicker();
+}
+
+// --------------------------------------------------------------- three -----
+const scene = new THREE.Scene();
+const FOV = 60;
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 1, 5000);
+camera.position.z = H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+const renderer = new THREE.WebGLRenderer({ canvas: $("stage"), alpha: true, antialias: true });
+renderer.setSize(W, H, false);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+const key = new THREE.DirectionalLight(0xffffff, 1.05); key.position.set(0.4, 1.6, 2.4);
+const rim = new THREE.DirectionalLight(0x88aaff, 0.35); rim.position.set(-1.5, 0.6, -1.4);
+scene.add(key, rim);
+
+const alignGroup = new THREE.Group();
+scene.add(alignGroup);
+
+const CAPSULE_SPEC = [
+  { label: "chestUpper", a: "spine01", b: "neck01", owners: ["spine01", "breast"], elliptical: true },
+  { label: "chest", a: "spine03", b: "spine01", owners: ["spine02", "spine03", "breast"], elliptical: true },
+  { label: "waist", a: "spine04", b: "spine03", owners: ["spine03", "spine04"], elliptical: true },
+  { label: "hips", a: ["upperleg01.L", "upperleg01.R"], b: "spine04", owners: ["pelvis", "spine04"], elliptical: true },
+  { label: "shoulderL", a: "clavicle.L", b: "upperarm01.L", owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "shoulderR", a: "clavicle.R", b: "upperarm01.R", owners: ["clavicle", "shoulder"], elliptical: false },
+  { label: "armL", a: "upperarm01.L", b: "lowerarm01.L", owners: ["upperarm01.L", "upperarm02.L"], elliptical: false },
+  { label: "armR", a: "upperarm01.R", b: "lowerarm01.R", owners: ["upperarm01.R", "upperarm02.R"], elliptical: false },
+  { label: "forearmL", a: "lowerarm01.L", b: "wrist.L", owners: ["lowerarm01.L", "lowerarm02.L"], elliptical: false },
+  { label: "forearmR", a: "lowerarm01.R", b: "wrist.R", owners: ["lowerarm01.R", "lowerarm02.R"], elliptical: false },
+  { label: "neck", a: "neck01", b: "head", owners: ["neck"], elliptical: false },
+];
+
+let device = null, sim = null, skinned = null, twinModel = null;
+let garmentMesh = null, renderPos = null, garmentPrint = null;
+let capsules = [], boneByName = new Map();
+let twinTorsoMetres = 0, twinShoulderMetres = 0;
+const restDirs = new Map(), plan = [];
+
+const DRIVEN = [
+  ["upperarm01.L", "lowerarm01.L", 11, 13], ["lowerarm01.L", "wrist.L", 13, 15],
+  ["upperarm01.R", "lowerarm01.R", 12, 14], ["lowerarm01.R", "wrist.R", 14, 16],
+  ["upperleg01.L", "lowerleg01.L", 23, 25], ["lowerleg01.L", "foot.L", 25, 27],
+  ["upperleg01.R", "lowerleg01.R", 24, 26], ["lowerleg01.R", "foot.R", 26, 28],
+  ["wrist.L", "metacarpal1.L", 15, 19], ["wrist.R", "metacarpal1.R", 16, 20],
+];
+
+// ------------------------------------------------------------ smoothing ----
+const sf = (dt, c) => { const r = 2 * Math.PI * c * dt; return r / (r + 1); };
+class LPF { filter(v, a) { this.y = this.i ? a * v + (1 - a) * this.y : v; this.i = 1; return this.y; } }
+class OneEuro {
+  constructor(b = 0.3) { this.b = b; this.x = new LPF(); this.d = new LPF(); this.lv = null; this.lt = null; }
+  filter(v, t) {
+    if (this.lt === null) { this.lt = t; this.lv = v; return this.x.filter(v, 1); }
+    const dt = Math.max((t - this.lt) / 1000, 1 / 240); this.lt = t;
+    const dv = (v - this.lv) / dt; this.lv = v;
+    const e = this.d.filter(dv, sf(dt, 1));
+    return this.x.filter(v, sf(dt, 1 + this.b * Math.abs(e)));
+  }
+}
+const USED = [11, 12, 13, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 28];
+const wF = new Map(), iF = new Map();
+for (const i of USED) {
+  wF.set(i, [0, 0, 0].map(() => new OneEuro(0.3)));
+  iF.set(i, [0, 0, 0].map(() => new OneEuro(0.02)));
+}
+const smooth = (lms, f, t) => {
+  const o = {};
+  for (const i of USED) { const g = f.get(i), l = lms[i];
+    o[i] = { x: g[0].filter(l.x, t), y: g[1].filter(l.y, t), z: g[2].filter(l.z ?? 0, t) }; }
+  return o;
+};
+
+// ---------------------------------------------------------- retargeting ----
+// x is NOT negated: a mirror is a reflection, and setFromUnitVectors can only
+// produce a rotation. Pose anatomically, mirror the whole object at render.
+const toScene = (lm, o) => o.set(lm.x, -lm.y, -lm.z);
+const _t = new THREE.Vector3(), _pq = new THREE.Quaternion(), _q = new THREE.Quaternion();
+const _a = new THREE.Vector3(), _b = new THREE.Vector3();
+function parentModelQuat(bone, out) {
+  out.identity(); const c = [];
+  for (let p = bone.parent; p && p.isBone; p = p.parent) c.push(p);
+  for (let i = c.length - 1; i >= 0; i--) out.multiply(c[i].quaternion);
+  return out;
+}
+const ancestorScale = (b) => { let s = 1; for (let p = b.parent; p && p.isBone; p = p.parent) s *= p.scale.x || 1; return s; };
+const lenRatio = new Map();
+
+const _L = new THREE.Vector3(1,0,0), _U = new THREE.Vector3(0,1,0), _F = new THREE.Vector3(0,0,1);
+const _m = new THREE.Matrix4(), _rq = new THREE.Quaternion();
+const _l1 = new THREE.Vector3(), _l2 = new THREE.Vector3();
+const _sm = new THREE.Vector3(), _hm = new THREE.Vector3();
+function orientTorso(w, root) {
+  toScene(w[11], _l1); toScene(w[12], _l2);
+  _L.subVectors(_l1, _l2); if (_L.lengthSq() < 1e-8) return; _L.normalize();
+  _sm.addVectors(_l1, _l2).multiplyScalar(0.5);
+  toScene(w[23], _l1); toScene(w[24], _l2);
+  _hm.addVectors(_l1, _l2).multiplyScalar(0.5);
+  _U.subVectors(_sm, _hm); if (_U.lengthSq() < 1e-8) return; _U.normalize();
+  _F.crossVectors(_L, _U).normalize(); _U.crossVectors(_F, _L).normalize();
+  _m.makeBasis(_L, _U, _F); _rq.setFromRotationMatrix(_m);
+  root.quaternion.slerp(_rq, 0.5);
+}
+function retarget(w, raw) {
+  const root = skinned?.skeleton?.bones?.[0];
+  if (root) orientTorso(w, root);
+  const vis = (i) => raw?.[i]?.visibility ?? 1;
+  for (const { bone, a, b, restLen } of plan) {
+    if (vis(a) < 0.5 || vis(b) < 0.5) continue;
+    toScene(w[a], _a); toScene(w[b], _b);
+    _t.subVectors(_b, _a);
+    const m = _t.length(); if (m < 1e-4) continue;
+    _t.divideScalar(m);
+    parentModelQuat(bone, _pq); _t.applyQuaternion(_pq.invert());
+    _q.setFromUnitVectors(restDirs.get(bone), _t);
+    bone.quaternion.copy(_q);
+    const raw2 = THREE.MathUtils.clamp(m / restLen, 0.6, 1.6);
+    const prev = lenRatio.get(bone);
+    const s = prev === undefined ? raw2 : prev + (raw2 - prev) * 0.02;
+    lenRatio.set(bone, s);
+    bone.scale.setScalar(s / ancestorScale(bone));
+  }
+}
+
+// ------------------------------------------------------------ alignment ----
+let smoothScale = 0, sx = 0, sy = 0, have = false, hipsVisible = false;
+const _p1 = new THREE.Vector3(), _p2 = new THREE.Vector3();
+const _sh = new THREE.Vector3(), _hp = new THREE.Vector3();
+const pix = (lm, o) => o.set((0.5 - lm.x) * W, -(lm.y - 0.5) * H, 0);
+function align(lms) {
+  if (!twinTorsoMetres) return;
+  _sh.copy(pix(lms[11], _p1)).add(pix(lms[12], _p2)).multiplyScalar(0.5);
+  let scale;
+  if (hipsVisible) {
+    _hp.copy(pix(lms[23], _p1)).add(pix(lms[24], _p2)).multiplyScalar(0.5);
+    const t = _sh.distanceTo(_hp); if (t < 1) return;
+    scale = t / twinTorsoMetres;
+  } else {
+    // Hips out of frame: shoulder width is a rigid, fully visible span.
+    const sp = pix(lms[11], _p1).distanceTo(pix(lms[12], _p2));
+    if (sp < 1 || !twinShoulderMetres) return;
+    scale = sp / twinShoulderMetres;
+    _hp.set(_sh.x, _sh.y - twinTorsoMetres * scale, 0);
+  }
+  if (!have) { smoothScale = scale; sx = _hp.x; sy = _hp.y; have = true; }
+  else { smoothScale += (scale - smoothScale) * 0.6; sx += (_hp.x - sx) * 0.6; sy += (_hp.y - sy) * 0.6; }
+  alignGroup.position.set(sx, sy, 0);
+  alignGroup.scale.set(-smoothScale, smoothScale, smoothScale);   // negative x = the mirror
+}
+
+// ------------------------------------------------------------- body frame --
+const FRAME = { left: _L, up: _U, front: _F };
+function bodyFrame() {
+  const P = (n) => { const b = boneByName.get(norm(n));
+    return b ? twinModel.worldToLocal(b.getWorldPosition(new THREE.Vector3())) : null; };
+  const sl = P("upperarm01.L"), sr = P("upperarm01.R");
+  const hl = P("upperleg01.L"), hr = P("upperleg01.R");
+  if (!sl || !sr || !hl || !hr) return FRAME;
+  _L.subVectors(sl, sr).normalize();
+  _U.copy(sl).add(sr).multiplyScalar(0.5).sub(hl.add(hr).multiplyScalar(0.5)).normalize();
+  _F.crossVectors(_L, _U).normalize(); _U.crossVectors(_F, _L).normalize();
+  return FRAME;
+}
+
+// ---------------------------------------------------------------- drape ----
+function drape() {
+  if (!device || !twinModel || !capsules.length) return;
+  try {
+    twinModel.updateWorldMatrix(true, true);
+    poseCapsules(capsules, twinModel, bodyFrame(), 0);
+    const pat = patternFor(style, size);
+    const drafted = draftShirt({
+      caps: capsules, res: 72, ease: pat.ease,
+      neckCircum: pat.neckCircum, sleeveLength: pat.sleeveLength,
+      lengthRatio: pat.lengthRatio,
+    });
+    if (!sim) sim = new GarmentSim(device, { substeps: 6 });
+    sim.spawn(drafted, capsules.length);
+    sim.iterations = 6;
+    sim.bendCompliance = pat.drape;      // fleece holds its shape, jersey clings
+    sim.friction = 0.85;
+    if (garmentMesh) { twinModel.remove(garmentMesh); garmentMesh.geometry.dispose(); }
+    const built = buildGarmentGeometry(drafted);
+    renderPos = built.renderPos;
+    garmentMesh = new THREE.Mesh(built.geometry,
+      makeGarmentMaterial(colour, { print: garmentPrint, geom: drafted.profile }));
+    twinModel.add(garmentMesh);
+    needsRedraft = false;
+    showFit();
+    errEl.textContent = "";
+  } catch (e) { errEl.textContent = e.message; console.error(e); }
+}
+
+// ----------------------------------------------------------------- coach ---
+const cctx = $("coach").getContext("2d");
+function coach(lms, ok, msg) {
+  cctx.clearRect(0, 0, W, H);
+  if (ok || !lms) { $("hint").hidden = !msg; $("hint").textContent = msg ?? ""; return; }
+  $("hint").hidden = false; $("hint").textContent = msg;
+  cctx.save();
+  cctx.setLineDash([10, 8]); cctx.lineWidth = 2;
+  cctx.strokeStyle = "rgba(240,179,82,.7)";
+  cctx.strokeRect(W * 0.1, H * 0.06, W * 0.8, H * 0.88);
+  cctx.restore();
+}
+
+// ------------------------------------------------------------------ loop ---
+let lastVT = -1, lastF = performance.now(), fps = 0, frames = 0, acc = 0, solveMs = 0;
+let landmarker = null, tracked = 0, ready = false;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  const dt = Math.min((now - lastF) / 1000, 1 / 25); lastF = now;
+
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    const seen = Boolean(res.worldLandmarks?.length && res.landmarks?.length);
+
+    let msg = null;
+    if (!seen) { ready = false; msg = null; }
+    else {
+      const lm = res.landmarks[0], raw = res.worldLandmarks[0];
+      const inFrame = (i) => lm[i] && lm[i].x > 0.03 && lm[i].x < 0.97 &&
+                             lm[i].y > 0.03 && lm[i].y < 0.97 &&
+                             (raw[i]?.visibility ?? 0) > 0.55;
+      const shouldersOk = inFrame(11) && inFrame(12);
+      hipsVisible = inFrame(23) && inFrame(24);
+      ready = shouldersOk;
+      if (!shouldersOk) msg = "Step back — shoulders need to be in frame";
+
+      if (ready) {
+        const sw = smooth(raw, wF, now);
+        retarget(sw, raw);
+        align(smooth(lm, iF, now));
+        alignGroup.updateMatrixWorld(true);
+        if (capsules.length) poseCapsules(capsules, twinModel, bodyFrame(), dt);
+        tracked++;
+        if ((needsRedraft || !garmentMesh) && tracked > 30) drape();
+      }
+      coach(lm, ready, msg);
+    }
+    if (!seen) coach(null, false, null);
+    res.segmentationMasks?.forEach((m) => m.close());
+  }
+
+  $("idle").hidden = ready || tracked > 30;
+  if (garmentMesh) garmentMesh.visible = ready;
+  $("fitcard").hidden = !(ready && garmentMesh);
+
+  if (sim?.gpu && garmentMesh && ready) {
+    const t0 = performance.now();
+    sim.setCapsules(capsules);
+    if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
+    solveMs = solveMs * 0.9 + (performance.now() - t0) * 0.1;
+  }
+
+  frames++; acc += dt;
+  if (acc >= 0.5) { fps = frames / acc; frames = 0; acc = 0; }
+  devEl.textContent = `${fps.toFixed(0)} fps · ${solveMs.toFixed(2)} ms` +
+    (sim?.sim ? `\n${sim.sim.N} particles` : "");
+
+  renderer.render(scene, camera);
+}
+
+// ------------------------------------------------------------------ boot ---
+async function startCamera() {
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  const cams = devs.filter((d) => d.kind === "videoinput");
+  const rgb = cams.find((d) => !/ir|infrared/i.test(d.label)) ?? cams[0];
+  const tries = [];
+  if (rgb) tries.push({ deviceId: { exact: rgb.deviceId }, width: { ideal: W }, height: { ideal: H } });
+  tries.push({ width: { ideal: W }, height: { ideal: H }, facingMode: "user" }, true);
+  let stream = null, last = null;
+  for (const c of tries) {
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: c, audio: false }); break; }
+    catch (e) { last = e; }
+  }
+  if (!stream) throw last;
+  video.srcObject = stream;
+  await new Promise((r) => { video.onloadedmetadata = r; });
+}
+
+(async () => {
+  buildPicker();
+  let step = "graphics";
+  try {
+    device = await createDevice();
+    step = "body model";
+    const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+    gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
+    skinned.frustumCulled = false;
+    skinned.visible = false;              // the wearer is the body; the twin is only a collision proxy
+    twinModel = gltf.scene;
+    alignGroup.add(twinModel);
+    twinModel.updateWorldMatrix(true, true);
+
+    const rest = new Map();
+    for (const b of skinned.skeleton.bones) {
+      boneByName.set(norm(b.name), b);
+      rest.set(b, b.getWorldPosition(new THREE.Vector3()));
+    }
+    const bo = (n) => boneByName.get(norm(n));
+    const mid = (a, b) => rest.get(bo(a)).clone().add(rest.get(bo(b))).multiplyScalar(0.5);
+    const shMid = mid("upperarm01.L", "upperarm01.R");
+    const hipMid = mid("upperleg01.L", "upperleg01.R");
+    twinTorsoMetres = shMid.distanceTo(hipMid);
+    twinShoulderMetres = rest.get(bo("upperarm01.L")).distanceTo(rest.get(bo("upperarm01.R")));
+    twinModel.position.sub(hipMid);
+    const seed = (H * 0.25) / twinTorsoMetres;
+    alignGroup.scale.set(-seed, seed, seed);
+
+    for (const [bn, en, a, b] of DRIVEN) {
+      const bone = bo(bn), end = bo(en);
+      if (!bone || !end) continue;
+      const d = rest.get(end).clone().sub(rest.get(bone));
+      if (d.lengthSq() < 1e-12) continue;
+      restDirs.set(bone, d.clone().normalize());
+      plan.push({ bone, a, b, restLen: d.length() });
+    }
+
+    twinModel.updateWorldMatrix(true, true);
+    capsules = measureCapsules(skinned, twinModel, CAPSULE_SPEC);
+    garmentPrint = await loadPrint("../assets/garment-print.png", { widthCm: 25 });
+    showFit();
+
+    step = "camera";
+    await startCamera();
+    step = "pose model";
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO", numPoses: 1,
+      minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3,
+      minTrackingConfidence: 0.3,
+    });
+    loop();
+  } catch (e) {
+    errEl.textContent = `${step} failed: ${e.name || "Error"} — ${e.message || ""}`;
+    console.error(step, e);
+  }
+})();
+</script>
+</body>
+</html>
