@@ -190,6 +190,27 @@ RESOLUTION SCALING`);
         `${String(cut).padStart(4)}`);
   }
 
+  // ---- armhole closure ----
+  // A hole at the shoulder is invisible to every numeric check above: the
+  // capsules are right, the seam constraints are right, and the mesh still has
+  // a gap you can see through, because constraints render nothing.
+  {
+    const g = draftShirt({ caps, res: 44, ease: 0.03 });
+    const built = buildGarmentGeometry(g);
+    const idx = built.geometry.index.array;
+    let bridge = 0;
+    const sleeveStart = g.bodyCount;
+    for (let i = 0; i < idx.length; i += 3) {
+      const a = idx[i], b = idx[i+1], c = idx[i+2];
+      const nBody = (a < sleeveStart) + (b < sleeveStart) + (c < sleeveStart);
+      if (nBody > 0 && nBody < 3) bridge++;   // spans body and sleeve
+    }
+    say(`
+ARMHOLE CLOSURE`);
+    say(`  triangles spanning body and sleeve: ${bridge}` +
+        `${bridge < 8 ? "   <<< SHOULDER IS OPEN" : "   ok"}`);
+  }
+
   for (const ease of [-0.01, 0.03, 0.09]) {
     const g = draftShirt({ caps, res: 44, ease });
     let nan = 0;

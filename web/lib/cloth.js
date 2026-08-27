@@ -1521,6 +1521,14 @@ export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
   };
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uThickness = mat.userData.thickness;
+    // DoubleSide lights the inside of the garment exactly like the outside,
+    // which is why it reads as paper rather than cloth — you see through a neck
+    // opening or a hem and the interior is as bright as the chest. Real fabric
+    // interiors are shadowed and slightly desaturated.
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <color_fragment>",
+      `#include <color_fragment>
+       if (!gl_FrontFacing) { diffuseColor.rgb *= 0.55; }`);
     // Backtick templates, not "..." with escapes: the newline matters to GLSL
     // and an escaped \n inside a quoted string is exactly what broke this file
     // once already.
@@ -1601,6 +1609,28 @@ export function buildGarmentGeometry(sim) {
         const d = si(c, r + 1), e = si(c + 1, r + 1);
         tri.push(a, d, b, b, d, e);
       }
+    }
+
+    // BRIDGE THE ARMHOLE. Without this there is a hole at each shoulder you can
+    // see straight through.
+    //
+    // The seam is a set of distance CONSTRAINTS — physics. It holds the sleeve's
+    // first ring against the armhole rim, coincident and inextensible, and the
+    // simulation is entirely correct. But constraints render nothing. The rim
+    // and the ring are different vertices, so unless triangles span the gap
+    // between them the joint is literally open.
+    //
+    // Every sleeve column already knows which rim particle it was cut from, so
+    // the bridge is a strip between consecutive pairs.
+    if (!s.ring) continue;
+    for (let c = 0; c < s.SCOL; c++) {
+      const b0 = s.ring[c], b1 = s.ring[(c + 1) % s.SCOL];
+      // The rim usually holds fewer points than the sleeve has columns, so
+      // neighbouring columns can share one rim particle. That quad has no area.
+      if (b0 < 0 || b1 < 0 || b0 === b1) continue;
+      if (!act[b0] || !act[b1]) continue;
+      const s0 = si(c, 0), s1 = si(c + 1, 0);
+      tri.push(b0, s0, b1, b1, s0, s1);
     }
   }
   geometry.setIndex(tri);
