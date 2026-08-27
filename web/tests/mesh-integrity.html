@@ -1,0 +1,110 @@
+<!DOCTYPE html><meta charset="utf-8">
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<body><pre id="o">running…</pre>
+<script type="module">
+// Is the garment mesh actually closed where it should be?
+//
+// Every numeric check we had passed while the shoulder had a hole you could see
+// through, because a hole is not a wrong number — it is a missing face. This
+// finds them topologically instead.
+//
+// An edge shared by exactly ONE triangle is a boundary edge. Chain those into
+// loops and a correct t-shirt has precisely four: the neck, the hem, and two
+// cuffs. Any other loop is a hole, and its position says which one.
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { measureCapsules, poseCapsules, draftShirt, buildGarmentGeometry, norm } from "../lib/cloth.js";
+import { GARMENTS, patternFor } from "../lib/garments.js";
+
+const L=[]; const say=s=>{L.push(s);document.getElementById("o").textContent=L.join("\n");};
+const SPEC = [
+  { label:"chestUpper", a:"spine01", b:"neck01", owners:["spine01","breast"], elliptical:true },
+  { label:"chest", a:"spine03", b:"spine01", owners:["spine02","spine03","breast"], elliptical:true },
+  { label:"waist", a:"spine04", b:"spine03", owners:["spine03","spine04"], elliptical:true },
+  { label:"hips", a:["upperleg01.L","upperleg01.R"], b:"spine04", owners:["pelvis","spine04"], elliptical:true },
+  { label:"shoulderL", a:"clavicle.L", b:"upperarm01.L", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"shoulderR", a:"clavicle.R", b:"upperarm01.R", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"armL", a:"upperarm01.L", b:"lowerarm01.L", owners:["upperarm01.L","upperarm02.L"], elliptical:false },
+  { label:"armR", a:"upperarm01.R", b:"lowerarm01.R", owners:["upperarm01.R","upperarm02.R"], elliptical:false },
+  { label:"forearmL", a:"lowerarm01.L", b:"wrist.L", owners:["lowerarm01.L","lowerarm02.L"], elliptical:false },
+  { label:"forearmR", a:"lowerarm01.R", b:"wrist.R", owners:["lowerarm01.R","lowerarm02.R"], elliptical:false },
+  { label:"neck", a:"neck01", b:"head", owners:["neck"], elliptical:false },
+];
+
+function boundaryLoops(geom) {
+  const idx = geom.index.array;
+  const count = new Map();          // "a,b" (sorted) -> times used
+  for (let i = 0; i < idx.length; i += 3) {
+    for (const [x, y] of [[idx[i],idx[i+1]],[idx[i+1],idx[i+2]],[idx[i+2],idx[i]]]) {
+      if (x === y) continue;                       // degenerate, ignore
+      const k = x < y ? `${x},${y}` : `${y},${x}`;
+      count.set(k, (count.get(k) ?? 0) + 1);
+    }
+  }
+  // adjacency over boundary edges only
+  const adj = new Map();
+  let nonManifold = 0;
+  for (const [k, n] of count) {
+    if (n > 2) nonManifold++;
+    if (n !== 1) continue;
+    const [a, b] = k.split(",").map(Number);
+    if (!adj.has(a)) adj.set(a, []); adj.get(a).push(b);
+    if (!adj.has(b)) adj.set(b, []); adj.get(b).push(a);
+  }
+  const seen = new Set(), loops = [];
+  for (const start of adj.keys()) {
+    if (seen.has(start)) continue;
+    const loop = []; let cur = start;
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur); loop.push(cur);
+      cur = (adj.get(cur) ?? []).find((n) => !seen.has(n));
+    }
+    if (loop.length > 2) loops.push(loop);
+  }
+  return { loops, nonManifold };
+}
+
+try {
+  const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+  let sk=null; gltf.scene.traverse(o=>{if(o.isSkinnedMesh)sk=o;});
+  const root = gltf.scene;
+  const align = new THREE.Group(); align.add(root); align.scale.set(-279,279,279);
+  const caps = measureCapsules(sk, root, SPEC);
+  const byName = new Map(sk.skeleton.bones.map(b=>[norm(b.name),b]));
+  const P = n => root.worldToLocal(byName.get(norm(n)).getWorldPosition(new THREE.Vector3()));
+  const left = P("upperarm01.L").sub(P("upperarm01.R")).normalize();
+  const up = P("upperarm01.L").add(P("upperarm01.R")).multiplyScalar(0.5)
+    .sub(P("upperleg01.L").add(P("upperleg01.R")).multiplyScalar(0.5)).normalize();
+  const front = new THREE.Vector3().crossVectors(left,up).normalize();
+  up.crossVectors(front,left).normalize();
+  poseCapsules(caps, root, {left,up,front}, 0);
+
+  let bad = 0;
+  for (const id of Object.keys(GARMENTS)) {
+    const pat = patternFor(id, "M");
+    const g = draftShirt({ caps, res: 64, ease: pat.ease, neckCircum: pat.neckCircum,
+      sleeveLength: pat.sleeveLength, lengthRatio: pat.lengthRatio });
+    const built = buildGarmentGeometry(g);
+    const { loops, nonManifold } = boundaryLoops(built.geometry);
+
+    // Describe each loop by where it sits, so an unexpected one is identifiable
+    const pos = built.renderPos;
+    const described = loops.map(l => {
+      let y = 0, x = 0;
+      for (const v of l) { y += pos[v*3+1]; x += pos[v*3]; }
+      return { n: l.length, y: y/l.length, x: x/l.length };
+    }).sort((a,b) => b.y - a.y);
+
+    const ok = loops.length === 4 && nonManifold === 0;
+    if (!ok) bad++;
+    say(`${GARMENTS[id].name}`);
+    say(`  open edges: ${loops.length} loop(s)  ${ok ? "ok — neck, hem, 2 cuffs" : "<<< EXPECTED 4"}`);
+    for (const d of described) {
+      say(`     ${String(d.n).padStart(4)} verts  y=${d.y.toFixed(3)}  x=${d.x.toFixed(3)}`);
+    }
+    if (nonManifold) say(`  NON-MANIFOLD edges: ${nonManifold}   <<< faces overlap`);
+  }
+  say(bad ? `\n${bad} GARMENT(S) HAVE UNEXPECTED HOLES` : "\nall garments closed as expected");
+  say("DONE");
+} catch(e) { say("FAILED: "+e.message+"\n"+(e.stack||"").split("\n").slice(0,3).join("\n")); }
+</script>

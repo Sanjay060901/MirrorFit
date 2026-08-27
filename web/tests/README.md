@@ -9,6 +9,8 @@ before touching the capsule or drafting code.
 |---|---|
 | `garment-geometry.html` | Do the capsules measure sane radii? Does `draftShirt` produce sleeves, armholes and no NaNs, at several ease values? |
 | `body-slices.html` | Ground truth: the twin's real half-width and half-depth at 40 mm height intervals. Use this to check a capsule, never the other way round. |
+| `mesh-integrity.html` | Are the panels actually sewn shut? Counts ordered boundary loops; a correct t-shirt has exactly four — neck, hem, two cuffs. |
+| `fit-engine.html` | Does the size chart come out monotonic and sane from the measured body? |
 | `bone-ownership.html` | Which bone dominates which vertices, and where those vertices sit. Use it to choose an `owners` list. |
 
 Run one:
@@ -37,3 +39,22 @@ Both were invisible from looking at the code, and both would have read as
 
 The lesson worth keeping: a capsule's radius is only meaningful relative to the
 vertices it was measured from, and the skinning decides which those are.
+
+## A third bug these found
+
+- **The shoulder was open.** The sleeve seam existed only as distance
+  constraints — physics, not geometry — so nothing rendered between the armhole
+  rim and the sleeve ring. Every numeric check passed while you could see
+  straight through the joint, because a hole is not a wrong number, it is a
+  missing face.
+
+  Two fixes were needed. Pairing sleeve column *c* with rim point *c* only
+  closes the seam when both loops have the same vertex count; measured, the rim
+  had 48 against the sleeve's 20. And ordering the rim by angle is not the same
+  as ordering it by adjacency — the rim is a staircase, not a circle, so the
+  sorted order zigzagged and left a lace of small holes.
+
+  The seam is now taken from the triangle topology: a directed edge `a->b` is on
+  the boundary when `b->a` does not exist, which yields loops in traversal
+  order, and those are zippered to the sleeve by fraction-of-the-way-round so
+  any two vertex counts close cleanly.

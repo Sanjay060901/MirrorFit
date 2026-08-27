@@ -667,12 +667,14 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
     // stitch then has a rest length of ~0, which is what "sewn" means.
     const rim = hole ? rimFor(hole) : [];
     const ringPts = [];
+    let rimOrdered = [];
     if (rim.length >= 6) {
       const withAngle = rim.map((i) => {
         const p = new THREE.Vector3(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
         const d = p.clone().sub(arm.a);
         return { i, p, th: Math.atan2(d.dot(v2), d.dot(u)) };
       }).sort((a, b) => a.th - b.th);
+      rimOrdered = withAngle.map((w) => w.i);
       for (let c = 0; c < SCOL; c++) {
         // Walk the rim in angular order and pick the nearest sample, so the
         // sleeve's columns wrap the hole the same way round.
@@ -718,7 +720,12 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
         sleeveUv.push(c / SCOL, 1 - r / SROW);
       }
     }
-    sleeves.push({ base, SCOL, SROW, ring: ringPts.map((r) => r.body) });
+    // rimOrdered is every rim particle in angular order. The resampled `ring`
+    // drives the seam CONSTRAINTS; the full rim drives the seam GEOMETRY,
+    // because the rim usually has more vertices than the sleeve has columns
+    // and stitching only the sampled ones leaves the rest of the hole open.
+    sleeves.push({ base, SCOL, SROW, ring: ringPts.map((r) => r.body),
+                   rim: rimOrdered });
   }
 
   const TOTAL = N + sleevePos.length / 4;
@@ -1575,6 +1582,37 @@ export function loadPrint(url, opts = {}) {
   });
 }
 
+
+// Ordered boundary loops of a triangle soup.
+//
+// A directed edge a->b is on the boundary when b->a does not also exist: an
+// interior edge is always traversed once in each direction by the two triangles
+// sharing it. Following those directed edges yields loops in TRAVERSAL ORDER,
+// which is the part that matters — an earlier attempt sorted rim vertices by
+// angle instead, and because the rim is a jagged staircase rather than a circle
+// the sorted order was not the adjacency order, so stitching it produced a
+// zigzag full of small holes.
+function boundaryLoops(tri) {
+  const dir = new Set();
+  for (let i = 0; i < tri.length; i += 3) {
+    const [a, b, c] = [tri[i], tri[i + 1], tri[i + 2]];
+    dir.add(`${a}_${b}`); dir.add(`${b}_${c}`); dir.add(`${c}_${a}`);
+  }
+  const next = new Map();
+  for (const e of dir) {
+    const [a, b] = e.split("_").map(Number);
+    if (!dir.has(`${b}_${a}`) && !next.has(a)) next.set(a, b);
+  }
+  const seen = new Set(), loops = [];
+  for (const start of next.keys()) {
+    if (seen.has(start)) continue;
+    const loop = []; let v = start;
+    while (v !== undefined && !seen.has(v)) { seen.add(v); loop.push(v); v = next.get(v); }
+    if (loop.length >= 3) loops.push(loop);
+  }
+  return loops;
+}
+
 /** Build the renderable mesh for a drafted garment. */
 export function buildGarmentGeometry(sim) {
   const geometry = new THREE.BufferGeometry();
@@ -1611,28 +1649,69 @@ export function buildGarmentGeometry(sim) {
       }
     }
 
-    // BRIDGE THE ARMHOLE. Without this there is a hole at each shoulder you can
-    // see straight through.
-    //
-    // The seam is a set of distance CONSTRAINTS — physics. It holds the sleeve's
-    // first ring against the armhole rim, coincident and inextensible, and the
-    // simulation is entirely correct. But constraints render nothing. The rim
-    // and the ring are different vertices, so unless triangles span the gap
-    // between them the joint is literally open.
-    //
-    // Every sleeve column already knows which rim particle it was cut from, so
-    // the bridge is a strip between consecutive pairs.
-    if (!s.ring) continue;
-    for (let c = 0; c < s.SCOL; c++) {
-      const b0 = s.ring[c], b1 = s.ring[(c + 1) % s.SCOL];
-      // The rim usually holds fewer points than the sleeve has columns, so
-      // neighbouring columns can share one rim particle. That quad has no area.
-      if (b0 < 0 || b1 < 0 || b0 === b1) continue;
-      if (!act[b0] || !act[b1]) continue;
-      const s0 = si(c, 0), s1 = si(c + 1, 0);
-      tri.push(b0, s0, b1, b1, s0, s1);
+  }
+
+  // ---- sew each sleeve to its armhole ----
+  //
+  // Done AFTER both panels exist, from the real topology: find the body's
+  // boundary loops, take the one nearest each sleeve, and zipper it to the
+  // sleeve's first ring. The loops carry different vertex counts — on the twin
+  // the rim has 48 against the sleeve's 20 — so the walk advances whichever
+  // loop is further behind, which closes the seam for any pair of counts.
+  // Body-panel loops only. The sleeve tubes are open at both ends, so their own
+  // rings are boundary loops as well — and the loop nearest a sleeve ring is
+  // that very ring, at distance zero. Filtering by index keeps the search
+  // looking at the panel it is supposed to sew to.
+  const bodyLoops = boundaryLoops(tri)
+    .filter((l) => l.length >= 4 && l.every((v) => v < sim.bodyCount));
+  const centroid = (loop) => {
+    const c = { x: 0, y: 0, z: 0 };
+    for (const v of loop) { c.x += sim.pos[v * 4]; c.y += sim.pos[v * 4 + 1]; c.z += sim.pos[v * 4 + 2]; }
+    c.x /= loop.length; c.y /= loop.length; c.z /= loop.length;
+    return c;
+  };
+  const dist2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2;
+
+  for (const s of sim.sleeves) {
+    const si = (c, r) => s.base + r * s.SCOL + ((c % s.SCOL) + s.SCOL) % s.SCOL;
+    const ring = [];
+    for (let c = 0; c < s.SCOL; c++) ring.push(si(c, 0));
+    const ringC = centroid(ring);
+
+    let hole = null, bestD = Infinity;
+    for (const l of bodyLoops) {
+      if (l.used) continue;
+      const d = dist2(centroid(l), ringC);
+      if (d < bestD) { bestD = d; hole = l; }
+    }
+    if (!hole) continue;
+    hole.used = true;                       // one armhole per sleeve
+
+    // Start both loops at the same place, or the seam spirals.
+    let off = 0, bo = Infinity;
+    for (let k = 0; k < hole.length; k++) {
+      const v = hole[k];
+      const d = (sim.pos[v * 4] - sim.pos[ring[0] * 4]) ** 2 +
+                (sim.pos[v * 4 + 1] - sim.pos[ring[0] * 4 + 1]) ** 2 +
+                (sim.pos[v * 4 + 2] - sim.pos[ring[0] * 4 + 2]) ** 2;
+      if (d < bo) { bo = d; off = k; }
+    }
+
+    const nR = hole.length, nS = ring.length;
+    let i = 0, j = 0;
+    while (i < nR || j < nS) {
+      const r0 = hole[(off + i) % nR], sA = ring[j % nS];
+      if (j >= nS || (i < nR && (i + 1) / nR <= (j + 1) / nS)) {
+        const r1 = hole[(off + i + 1) % nR];
+        if (r0 !== r1) tri.push(r0, sA, r1);
+        i++;
+      } else {
+        tri.push(r0, ring[(j + 1) % nS], sA);
+        j++;
+      }
     }
   }
+
   geometry.setIndex(tri);
   geometry.computeVertexNormals();
   // The simulation moves vertices far outside the bounding volume computed
