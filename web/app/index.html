@@ -180,7 +180,7 @@ import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/
 import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 import {
   createDevice, measureCapsules, poseCapsules, draftShirt, GarmentSim,
-  buildGarmentGeometry, makeGarmentMaterial, loadPrint, norm,
+  buildGarmentGeometry, makeGarmentMaterial, loadPrint, applyGirthScale, norm,
 } from "../lib/cloth.js";
 import { GARMENTS, SIZES, patternFor, fitReport, recommendSize } from "../lib/garments.js";
 
@@ -466,6 +466,57 @@ function drape() {
   } catch (e) { errEl.textContent = e.message; console.error(e); }
 }
 
+// ------------------------------------------------- wearer's own girth -----
+//
+// The twin is a stock body. Posing it to your joints puts it in the right
+// PLACE with the wrong DIMENSIONS, so without this the garment is drafted for
+// Anny and merely drawn over you.
+//
+// Silhouette width is directly observable — no solver, nothing to converge, and
+// it cannot saturate at a clamp. Walk outward from the torso centreline and
+// stop at the first background pixel, which returns the contiguous body run and
+// naturally excludes an arm separated by a gap.
+const GIRTH_LEVELS = { chest: 0.30, waist: 0.62, hips: 0.95 };
+const girth = { chest: null, waist: null, hips: null };
+let girthApplied = 0;
+
+function measureGirth(mask, lm) {
+  if (!mask || !have || smoothScale < 1) return;
+  const w = mask.width, h = mask.height;
+  const probs = mask.getAsFloat32Array();
+  if (!probs || probs.length < w * h) return;
+
+  const sx2 = ((lm[11].x + lm[12].x) / 2) * w, sy2 = ((lm[11].y + lm[12].y) / 2) * h;
+  const hx = ((lm[23].x + lm[24].x) / 2) * w, hy = ((lm[23].y + lm[24].y) / 2) * h;
+  if (Math.hypot(hx - sx2, hy - sy2) < 8) return;
+
+  for (const [label, t] of Object.entries(GIRTH_LEVELS)) {
+    const row = Math.round(sy2 + t * (hy - sy2));
+    const cx = Math.round(sx2 + t * (hx - sx2));
+    if (row < 0 || row >= h || cx < 1 || cx >= w - 1) continue;
+    if (probs[row * w + cx] < 0.5) continue;
+    let L = cx, R = cx;
+    while (L > 0 && probs[row * w + L - 1] >= 0.5) L--;
+    while (R < w - 1 && probs[row * w + R + 1] >= 0.5) R++;
+    if (L === 0 || R === w - 1) continue;      // cut off by the frame edge
+    // mask px -> image px -> metres, using the alignment scale we already have
+    const metres = ((R - L) / w) * W / smoothScale;
+    // Heavy smoothing: this is a property of the person, not of the frame.
+    girth[label] = girth[label] == null ? metres : girth[label] * 0.94 + metres * 0.06;
+  }
+}
+
+function girthScales() {
+  const out = {};
+  for (const label of Object.keys(GIRTH_LEVELS)) {
+    const c = capsules.find((x) => x.label === label);
+    if (!c || girth[label] == null) continue;
+    // The capsule's own width is 2 * rx; compare like with like.
+    out[label] = girth[label] / (2 * (c.rx0 ?? c.rx));
+  }
+  return out;
+}
+
 // ----------------------------------------------------------------- coach ---
 const cctx = $("coach").getContext("2d");
 function coach(lms, ok, msg) {
@@ -506,12 +557,22 @@ function loop() {
       if (!shouldersOk) msg = "Step back — shoulders need to be in frame";
 
       if (ready) {
+        measureGirth(res.segmentationMasks?.[0], lm);
         const sw = smooth(raw, wF, now);
         retarget(sw, raw);
         align(smooth(lm, iF, now));
         alignGroup.updateMatrixWorld(true);
         if (capsules.length) poseCapsules(capsules, twinModel, bodyFrame(), dt);
         tracked++;
+        // Re-cut the pattern once the measured girth has moved enough to matter.
+        // 3% of chest width is about 1 cm — below that the shopper would see no
+        // difference and re-drafting would only make the garment twitch.
+        const gs = girthScales();
+        if (gs.chest && Math.abs(gs.chest - girthApplied) > 0.03) {
+          girthApplied = gs.chest;
+          applyGirthScale(capsules, gs);
+          needsRedraft = true;
+        }
         if ((needsRedraft || !garmentMesh) && tracked > 30) drape();
       }
       coach(lm, ready, msg);
@@ -611,6 +672,7 @@ async function startCamera() {
         delegate: "GPU",
       },
       runningMode: "VIDEO", numPoses: 1,
+      outputSegmentationMasks: true,   // the only channel that observes girth
       minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3,
       minTrackingConfidence: 0.3,
     });

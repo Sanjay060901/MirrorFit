@@ -228,14 +228,14 @@ export function measureCapsules(skinned, root, spec) {
       console.warn(`capsule ${s.label}: only ${owned.length} owned vertices, ` +
                    `falling back to segment length — RADIUS IS A GUESS`);
       const r = clamp(ab.length() * 0.35);
-      out.push({ ...s, aBones, bBones, rx: r, rz: r, dz: 0, degraded: true });
+      out.push({ ...s, aBones, bBones, rx: r, rz: r, rx0: r, rz0: r, dz: 0, degraded: true });
       continue;
     }
 
     const rad = percentile(radial, RADIUS_PERCENTILE);
     if (!s.elliptical) {
       const r = clamp(rad);
-      out.push({ ...s, aBones, bBones, rx: r, rz: r, dz: 0 });
+      out.push({ ...s, aBones, bBones, rx: r, rz: r, rx0: r, rz0: r, dz: 0 });
       continue;
     }
 
@@ -254,13 +254,52 @@ export function measureCapsules(skinned, root, spec) {
       rz = (f + bk) / 2;      // half-depth, not full depth
       dz = (f - bk) / 2;      // how far the axis must shift forward
     }
-    out.push({ ...s, aBones, bBones, rx, rz: clamp(rz), dz });
+    out.push({ ...s, aBones, bBones, rx, rz: clamp(rz), dz,
+               rx0: rx, rz0: clamp(rz) });
   }
 
   console.log("capsules:\n" + out.map((c) =>
     `  ${c.label.padEnd(11)} rx=${c.rx.toFixed(3)} rz=${c.rz.toFixed(3)} ` +
     `shift=${c.dz.toFixed(3)}`).join("\n"));
   return out;
+}
+
+/**
+ * Scale a capsule's girth to the wearer, rather than leaving it at the stock
+ * body's.
+ *
+ * THIS IS THE DIFFERENCE BETWEEN "a correctly fitted shirt" AND "a correctly
+ * fitted shirt on the right person". Everything else in this file measures the
+ * TWIN — Anny's neutral body, 77.5 cm around the chest. Posing that twin to the
+ * wearer's joints puts it in the right place with the wrong dimensions, so the
+ * garment is drafted for somebody else and then drawn over the shopper.
+ *
+ * Silhouette width from the segmentation mask is directly observable, unlike
+ * anything the shape-fit solver tries to infer, so it needs no convergence and
+ * cannot saturate. Its honest limitation: it measures the shopper's CLOTHING,
+ * so a loose top reads wider than the body underneath. That still makes the
+ * garment match the visible outline, which is what "it fits me" looks like —
+ * it just means the resulting number is a clothed silhouette, not a body
+ * measurement, and must not be presented as one.
+ *
+ * Depth is not observable from one frontal view, so the twin's own
+ * width-to-depth ratio is carried over. Wrong for unusual builds, and far
+ * closer than assuming the stock body.
+ *
+ * @param scaleByLabel e.g. { chest: 1.12, waist: 1.05, hips: 1.08 }
+ */
+export function applyGirthScale(caps, scaleByLabel, limits = [0.75, 1.6]) {
+  for (const c of caps) {
+    const s = scaleByLabel[c.label];
+    if (!s || !isFinite(s)) continue;
+    const k = THREE.MathUtils.clamp(s, limits[0], limits[1]);
+    // Always from the AS-MEASURED radius, never from the current one, or
+    // repeated calls compound into a balloon.
+    c.rx = (c.rx0 ?? c.rx) * k;
+    c.rz = (c.rz0 ?? c.rz) * k;
+    c.girthScale = k;
+  }
+  return caps;
 }
 
 /**
