@@ -1074,6 +1074,7 @@ export class GarmentSim {
     this.settleMs = null;
     this._spawnAt = 0;
     this._prev = null;
+    this.dispHistory = [];
   }
 
   /** Call when anything moves the body, so the solver wakes up again. */
@@ -1193,6 +1194,7 @@ export class GarmentSim {
     this.settleMs = null;
     this._spawnAt = performance.now();
     this._prev = new Float32Array(N * 3);
+    this.dispHistory = [];
     return this;
   }
 
@@ -1305,6 +1307,12 @@ export class GarmentSim {
         target[i * 3] = x; target[i * 3 + 1] = y; target[i * 3 + 2] = z;
       }
       this.maxDisp = Math.sqrt(maxSq);
+      // Keep a short trace so convergence can be READ rather than guessed:
+      // a curve that flattens toward zero is converging slowly, a curve
+      // that plateaus at a fixed height is oscillating and will never
+      // settle however long the loop runs.
+      this.dispHistory.push(this.maxDisp);
+      if (this.dispHistory.length > 240) this.dispHistory.shift();
       // 0.2 mm between readbacks is below what anyone can see on a garment.
       // Requiring several consecutive quiet frames avoids calling a momentary
       // pause at the top of a swing "settled".

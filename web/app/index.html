@@ -635,7 +635,13 @@ async function startCamera() {
     const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
     gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
     skinned.frustumCulled = false;
-    skinned.visible = false;              // the wearer is the body; the twin is only a collision proxy
+    // DEPTH-ONLY OCCLUDER, not hidden. visible = false removes the twin from the
+    // depth pass as well as the colour pass, so the garment draws over the
+    // wearer's arms instead of behind them. Opaque with colorWrite off: three.js
+    // draws every opaque object before any transparent one, and renderOrder only
+    // sorts within a pass, so a transparent occluder would come too late.
+    skinned.material = new THREE.MeshBasicMaterial({ colorWrite: false });
+    skinned.renderOrder = -1;
     twinModel = gltf.scene;
     alignGroup.add(twinModel);
     twinModel.updateWorldMatrix(true, true);
