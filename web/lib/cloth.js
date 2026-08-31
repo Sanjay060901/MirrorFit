@@ -1101,6 +1101,14 @@ export class GarmentSim {
     this.gpu = null;
     this.sim = null;
     this.numCapsules = 0;
+
+    // Read-only convergence trace. maxDisp is the largest distance any particle
+    // moved between readbacks — the quantity that distinguishes DECAY (settling
+    // slowly) from a PLATEAU (a limit cycle that will never settle, however
+    // long the loop runs).
+    this.maxDisp = Infinity;
+    this.dispHistory = [];
+    this._prev = null;
   }
 
   destroy() {
@@ -1207,6 +1215,9 @@ export class GarmentSim {
       paramsData: new ArrayBuffer(slots * UNIFORM_STRIDE),
       capData: new Float32Array(Math.max(numCapsules * 16, 16)),
     };
+    this.maxDisp = Infinity;
+    this.dispHistory = [];
+    this._prev = new Float32Array(N * 3);
     return this;
   }
 
@@ -1308,11 +1319,25 @@ export class GarmentSim {
     const count = this.sim.N;
     buf.mapAsync(GPUMapMode.READ).then(() => {
       const src = new Float32Array(buf.getMappedRange());
+      // MEASUREMENT ONLY. Largest distance any particle moved since the last
+      // readback. Nothing here gates or skips a solver call — the loop runs
+      // exactly as it would without it, which is what makes this safe to add to
+      // a known-good build in order to compare against a known-bad one.
+      let maxSq = 0;
+      const prev = this._prev;
       for (let i = 0; i < count; i++) {
-        target[i * 3]     = src[i * 4];
-        target[i * 3 + 1] = src[i * 4 + 1];
-        target[i * 3 + 2] = src[i * 4 + 2];
+        const x = src[i * 4], y = src[i * 4 + 1], z = src[i * 4 + 2];
+        if (prev) {
+          const dx = x - prev[i * 3], dy = y - prev[i * 3 + 1], dz = z - prev[i * 3 + 2];
+          const d = dx * dx + dy * dy + dz * dz;
+          if (d > maxSq) maxSq = d;
+          prev[i * 3] = x; prev[i * 3 + 1] = y; prev[i * 3 + 2] = z;
+        }
+        target[i * 3] = x; target[i * 3 + 1] = y; target[i * 3 + 2] = z;
       }
+      this.maxDisp = Math.sqrt(maxSq);
+      this.dispHistory.push(this.maxDisp);
+      if (this.dispHistory.length > 600) this.dispHistory.shift();
       buf.unmap();
       geometry.attributes.position.needsUpdate = true;
       geometry.computeVertexNormals();

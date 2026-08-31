@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Solver convergence bench</title>
+<style>
+  body { margin: 0; background: #0e1114; color: #dfe6ea; padding: 24px 26px;
+         font: 400 14px/1.6 ui-sans-serif, "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  p  { color: #8fa0aa; max-width: 70ch; margin: 0 0 14px; }
+  #plot { background: #14181c; border: 1px solid #222c32; border-radius: 4px;
+          display: block; margin: 14px 0; }
+  pre { background: #14181c; border: 1px solid #222c32; border-radius: 4px;
+        padding: 12px 14px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+        overflow-x: auto; max-height: 260px; }
+  #verdict { font: 600 15px/1.5 ui-sans-serif, system-ui, sans-serif;
+             padding: 10px 12px; border-radius: 4px; margin: 12px 0; }
+  .ok { background: #14301d; color: #7de08a; }
+  .bad { background: #3a1414; color: #ff8c8c; }
+  .wait { background: #33280f; color: #f0b352; }
+  button { background: #1d2a31; color: #cfe3ea; border: 1px solid #33454e;
+           border-radius: 4px; padding: 7px 13px; font: inherit; cursor: pointer; }
+  label { color: #8fa0aa; margin-right: 14px; }
+</style>
+</head>
+<body>
+<h1>Solver convergence bench</h1>
+<p>Runs the real solver for a fixed number of steps against a stationary body and
+records the largest distance any particle moved between steps. Colliders never
+move here, so anything that fails to settle is intrinsic to the solve rather
+than driven by a moving body.</p>
+<p><b>Needs a GPU.</b> Headless has no WebGPU device on this machine, so this
+page is the only way to obtain the curve — run it on the current checkout, then
+on any other commit, and compare.</p>
+
+<div>
+  <label>steps <input id="steps" type="number" value="500" min="50" max="3000" style="width:70px"></label>
+  <label>quality <input id="res" type="number" value="72" min="32" max="128" step="4" style="width:60px"></label>
+  <label>arms down <input id="arm" type="number" value="38" min="0" max="70" style="width:52px">°</label>
+  <button id="run">Run</button>
+</div>
+
+<div id="verdict" class="wait">idle</div>
+<canvas id="plot" width="900" height="260"></canvas>
+<pre id="out">Press Run.</pre>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { createDevice, measureCapsules, poseCapsules, draftShirt, GarmentSim,
+         buildGarmentGeometry, norm } from "../lib/cloth.js";
+
+const $ = (id) => document.getElementById(id);
+const out = $("out"), verdict = $("verdict");
+const SPEC = [
+  { label:"chestUpper", a:"spine01", b:"neck01", owners:["spine01","breast"], elliptical:true },
+  { label:"chest", a:"spine03", b:"spine01", owners:["spine02","spine03","breast"], elliptical:true },
+  { label:"waist", a:"spine04", b:"spine03", owners:["spine03","spine04"], elliptical:true },
+  { label:"hips", a:["upperleg01.L","upperleg01.R"], b:"spine04", owners:["pelvis","spine04"], elliptical:true },
+  { label:"shoulderL", a:"clavicle.L", b:"upperarm01.L", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"shoulderR", a:"clavicle.R", b:"upperarm01.R", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"armL", a:"upperarm01.L", b:"lowerarm01.L", owners:["upperarm01.L","upperarm02.L"], elliptical:false },
+  { label:"armR", a:"upperarm01.R", b:"lowerarm01.R", owners:["upperarm01.R","upperarm02.R"], elliptical:false },
+  { label:"forearmL", a:"lowerarm01.L", b:"wrist.L", owners:["lowerarm01.L","lowerarm02.L"], elliptical:false },
+  { label:"forearmR", a:"lowerarm01.R", b:"wrist.R", owners:["lowerarm01.R","lowerarm02.R"], elliptical:false },
+  { label:"neck", a:"neck01", b:"head", owners:["neck"], elliptical:false },
+];
+
+// Log axis: displacement spans microns to centimetres, and on a linear scale
+// the only thing that matters — whether the tail approaches zero or flattens —
+// is invisible.
+function plot(series) {
+  const c = $("plot"), g = c.getContext("2d");
+  const W = c.width, H = c.height, PAD = 34;
+  g.clearRect(0, 0, W, H);
+  const lo = Math.log10(1e-6), hi = Math.log10(1e-1);
+  const Y = (v) => H - PAD - ((Math.log10(Math.max(v, 1e-6)) - lo) / (hi - lo)) * (H - PAD * 2);
+  g.strokeStyle = "#26323a"; g.fillStyle = "#6b7d88";
+  g.font = "11px ui-monospace, Consolas, monospace";
+  for (const mm of [0.01, 0.1, 0.2, 1, 10, 100]) {
+    const y = Y(mm / 1000);
+    g.beginPath(); g.moveTo(PAD, y); g.lineTo(W - 8, y); g.stroke();
+    g.fillText(`${mm} mm`, 2, y + 3);
+  }
+  g.strokeStyle = "#f0b352"; g.setLineDash([4, 4]);
+  const gate = Y(0.0002); g.beginPath(); g.moveTo(PAD, gate); g.lineTo(W - 8, gate); g.stroke();
+  g.setLineDash([]);
+  g.strokeStyle = "#58c6d4"; g.lineWidth = 1.4; g.beginPath();
+  series.forEach((v, i) => {
+    const x = PAD + (i / Math.max(1, series.length - 1)) * (W - PAD - 8);
+    i ? g.lineTo(x, Y(v)) : g.moveTo(x, Y(v));
+  });
+  g.stroke();
+}
+
+// Decay vs limit cycle, decided from the tail rather than from three frames.
+function classify(series) {
+  const tail = series.slice(-Math.max(30, Math.floor(series.length * 0.2)));
+  const mean = tail.reduce((a, b) => a + b, 0) / tail.length;
+  const min = Math.min(...tail), max = Math.max(...tail);
+  const early = series.slice(0, tail.length);
+  const earlyMean = early.reduce((a, b) => a + b, 0) / early.length;
+  const ratio = earlyMean > 0 ? mean / earlyMean : 1;
+  return { mean, min, max, ratio, swing: max / Math.max(min, 1e-9) };
+}
+
+$("run").onclick = async () => {
+  verdict.className = "wait"; verdict.textContent = "running…";
+  out.textContent = "";
+  try {
+    const device = await createDevice();
+    const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+    let sk = null; gltf.scene.traverse((o) => { if (o.isSkinnedMesh) sk = o; });
+    const root = gltf.scene;
+    const align = new THREE.Group(); align.add(root);
+    align.scale.set(-279, 279, 279);
+    root.updateWorldMatrix(true, true);
+
+    const byName = new Map(sk.skeleton.bones.map((b) => [norm(b.name), b]));
+    const deg = Number($("arm").value) * Math.PI / 180;
+    for (const [n, sign] of [["upperarm01.L", -1], ["upperarm01.R", 1]]) {
+      const b = byName.get(norm(n));
+      if (b) b.quaternion.multiply(new THREE.Quaternion()
+        .setFromAxisAngle(new THREE.Vector3(0, 0, 1), sign * deg));
+    }
+    root.updateWorldMatrix(true, true);
+
+    const caps = measureCapsules(sk, root, SPEC);
+    const P = (n) => root.worldToLocal(byName.get(norm(n)).getWorldPosition(new THREE.Vector3()));
+    const left = P("upperarm01.L").sub(P("upperarm01.R")).normalize();
+    const up = P("upperarm01.L").add(P("upperarm01.R")).multiplyScalar(0.5)
+      .sub(P("upperleg01.L").add(P("upperleg01.R")).multiplyScalar(0.5)).normalize();
+    const front = new THREE.Vector3().crossVectors(left, up).normalize();
+    up.crossVectors(front, left).normalize();
+    poseCapsules(caps, root, { left, up, front }, 0);
+
+    const drafted = draftShirt({ caps, res: Number($("res").value), ease: 0.0159 });
+    const sim = new GarmentSim(device, { substeps: 6 });
+    sim.spawn(drafted, caps.length);
+    sim.iterations = 6; sim.bendCompliance = 4e-6; sim.friction = 0.85;
+    const built = buildGarmentGeometry(drafted);
+    const target = built.renderPos;
+
+    const N = Number($("steps").value);
+    sim.setCapsules(caps);                       // static: never updated again
+    for (let i = 0; i < N; i++) {
+      sim.step(1 / 60, true);
+      sim.readbackInto(built.geometry, target);
+      // one frame per step, so each readback pairs with exactly one solve
+      await new Promise(requestAnimationFrame);
+    }
+
+    const series = sim.dispHistory.slice();
+    plot(series);
+    const c = classify(series);
+    const settled = series.findIndex((v, i) =>
+      i > 5 && series.slice(i, i + 6).every((x) => x < 0.0002));
+    const converging = c.ratio < 0.35 && c.swing < 6;
+
+    verdict.className = converging ? "ok" : "bad";
+    verdict.textContent = converging
+      ? `CONVERGING — tail mean ${(c.mean * 1000).toFixed(3)} mm` +
+        (settled >= 0 ? `, crossed 0.2 mm at step ${settled}` : "")
+      : `LIMIT CYCLE — tail mean ${(c.mean * 1000).toFixed(2)} mm, ` +
+        `swings ${(c.min * 1000).toFixed(2)}–${(c.max * 1000).toFixed(2)} mm, ` +
+        `only ${((1 - c.ratio) * 100).toFixed(0)}% below its own early level`;
+
+    out.textContent =
+      `particles ${drafted.N}  constraints ${sim.gpu.totalC}  steps ${series.length}\n` +
+      `tail mean ${(c.mean * 1000).toFixed(4)} mm   min ${(c.min * 1000).toFixed(4)}   ` +
+      `max ${(c.max * 1000).toFixed(4)}   swing x${c.swing.toFixed(1)}\n` +
+      `late/early ratio ${c.ratio.toFixed(3)}  (decay << 1, limit cycle ~= 1)\n\n` +
+      `step, maxDisp_mm\n` +
+      series.map((v, i) => `${i}, ${(v * 1000).toFixed(4)}`).join("\n");
+  } catch (e) {
+    verdict.className = "bad";
+    verdict.textContent = "failed: " + e.message;
+    console.error(e);
+  }
+};
+</script>
+</body>
+</html>
