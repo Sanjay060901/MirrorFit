@@ -451,7 +451,6 @@ function drape() {
     });
     if (!sim) sim = new GarmentSim(device, { substeps: 6 });
     sim.spawn(drafted, capsules.length);
-    sim.wake();
     sim.iterations = 6;
     sim.bendCompliance = pat.drape;      // fleece holds its shape, jersey clings
     sim.friction = 0.85;
@@ -563,12 +562,7 @@ function loop() {
         retarget(sw, raw);
         align(smooth(lm, iF, now));
         alignGroup.updateMatrixWorld(true);
-        if (capsules.length) {
-          poseCapsules(capsules, twinModel, bodyFrame(), dt);
-          // Any real body movement restarts the solve.
-          const moved = capsules.some((c) => c.vel && c.vel.lengthSq() > 1e-6);
-          if (moved) sim?.wake();
-        }
+        if (capsules.length) poseCapsules(capsules, twinModel, bodyFrame(), dt);
         tracked++;
         // Re-cut the pattern once the measured girth has moved enough to matter.
         // 3% of chest width is about 1 cm — below that the shopper would see no
@@ -591,9 +585,7 @@ function loop() {
   if (garmentMesh) garmentMesh.visible = ready;
   $("fitcard").hidden = !(ready && garmentMesh);
 
-  // The wearer moves, so the solver only idles while both the cloth and the
-  // body are still; poseCapsules wakes it whenever the capsules shift.
-  if (sim?.gpu && garmentMesh && ready && !sim.converged) {
+  if (sim?.gpu && garmentMesh && ready) {
     const t0 = performance.now();
     sim.setCapsules(capsules);
     if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
@@ -635,13 +627,7 @@ async function startCamera() {
     const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
     gltf.scene.traverse((o) => { if (o.isSkinnedMesh) skinned = o; });
     skinned.frustumCulled = false;
-    // DEPTH-ONLY OCCLUDER, not hidden. visible = false removes the twin from the
-    // depth pass as well as the colour pass, so the garment draws over the
-    // wearer's arms instead of behind them. Opaque with colorWrite off: three.js
-    // draws every opaque object before any transparent one, and renderOrder only
-    // sorts within a pass, so a transparent occluder would come too late.
-    skinned.material = new THREE.MeshBasicMaterial({ colorWrite: false });
-    skinned.renderOrder = -1;
+    skinned.visible = false;              // the wearer is the body; the twin is only a collision proxy
     twinModel = gltf.scene;
     alignGroup.add(twinModel);
     twinModel.updateWorldMatrix(true, true);

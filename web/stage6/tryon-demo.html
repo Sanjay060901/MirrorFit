@@ -29,7 +29,6 @@
   <div><b>Stage 6.5 — garment demo</b></div>
   <div id="status">loading…</div>
   <div id="err"></div>
-  <canvas id="plot" width="212" height="40" style="width:212px;height:40px;background:#111;border-radius:4px;margin-top:6px"></canvas>
   <hr />
   <div>colour
     <span class="sw" data-c="c94f4f" style="background:#c94f4f"></span>
@@ -47,8 +46,8 @@
     <span id="armv">38</span>°</label>
   <hr />
   <label>body <select id="bodymode">
-    <option value="off" selected>hidden</option>
-    <option value="ghost">ghost (draws over the cloth)</option>
+    <option value="off">hidden</option>
+    <option value="ghost" selected>ghost</option>
     <option value="solid">solid</option>
   </select></label>
   <label><input type="checkbox" id="spin" checked /> turntable</label>
@@ -230,7 +229,6 @@ function drape() {
     const drafted = draftShirt({ caps: capsules, res, ease });
     if (!sim) sim = new GarmentSim(device, { substeps: 6 });
     sim.spawn(drafted, capsules.length);
-    sim.wake();
     sim.iterations = 7;
     syncUI();
 
@@ -278,8 +276,6 @@ $("arm").addEventListener("input", (e) => { $("armv").textContent = e.target.val
 $("res").addEventListener("input", (e) => { $("resv").textContent = e.target.value; });
 $("res").addEventListener("change", (e) => { res = Number(e.target.value); drape(); });
 $("redrape").addEventListener("click", drape);
-// Orbiting does not move the body, so it must not restart the solver.
-addEventListener("keydown", (e) => { if (e.key === "r") sim?.wake(); });
 $("spin").addEventListener("change", (e) => { controls.autoRotate = e.target.checked; });
 document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
   garmentColour = parseInt(el.dataset.c, 16);
@@ -303,30 +299,6 @@ addEventListener("keydown", (e) => {
   if (e.key === "c" && capsuleGroup) capsuleGroup.visible = !capsuleGroup.visible;
 });
 
-const pctx = $("plot").getContext("2d");
-// Log scale: displacement spans microns to centimetres, and on a linear axis
-// the part that matters — whether the tail approaches zero or flattens — is
-// invisible.
-function drawPlot() {
-  const h = sim?.dispHistory;
-  pctx.clearRect(0, 0, 212, 40);
-  if (!h || h.length < 2) return;
-  const lo = Math.log10(1e-5), hi = Math.log10(1e-1);
-  pctx.strokeStyle = "#333";
-  for (const mm of [0.2, 2, 20]) {          // 0.2 mm is the convergence gate
-    const y = 40 - ((Math.log10(mm / 1000) - lo) / (hi - lo)) * 40;
-    pctx.beginPath(); pctx.moveTo(0, y); pctx.lineTo(212, y); pctx.stroke();
-  }
-  pctx.strokeStyle = sim.converged ? "#6d6" : "#fa0";
-  pctx.beginPath();
-  h.forEach((v, i) => {
-    const x = (i / Math.max(1, h.length - 1)) * 212;
-    const y = 40 - ((Math.log10(Math.max(v, 1e-5)) - lo) / (hi - lo)) * 40;
-    i ? pctx.lineTo(x, y) : pctx.moveTo(x, y);
-  });
-  pctx.stroke();
-}
-
 let last = performance.now(), frames = 0, acc = 0, fps = 0, solveMs = 0, settled = 0;
 
 function loop() {
@@ -335,12 +307,7 @@ function loop() {
   const dt = Math.min((now - last) / 1000, 1 / 25);
   last = now;
 
-  // EARLY EXIT. The old readout counted wall-clock seconds since spawn and
-  // called that "settle", which measured nothing — it ran the full loop forever
-  // whether the cloth was moving or not. Now the solver stops once no particle
-  // has moved 0.2 mm between readbacks for six consecutive frames, and starts
-  // again the moment the body does.
-  if (sim?.gpu && garmentMesh && !sim.converged) {
+  if (sim?.gpu && garmentMesh) {
     const t0 = performance.now();
     sim.setCapsules(capsules);
     if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
@@ -353,12 +320,9 @@ function loop() {
   statusEl.innerHTML = sim?.sim
     ? `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(2)} ms<br>` +
       `${sim.sim.N} particles · ${sim.gpu.totalC} constraints<br>` +
-      (sim.converged
-        ? `<span style="color:#6d6">settled in ${(sim.settleMs / 1000).toFixed(2)} s — solver idle</span>`
-        : `settling… max move ${(sim.maxDisp * 1000).toFixed(2)} mm`)
+      `settled ${settled.toFixed(1)} s`
     : "loading…";
 
-  drawPlot();
   controls.update();
   renderer.render(scene, camera);
   maybeCapture();

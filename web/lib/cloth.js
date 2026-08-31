@@ -612,99 +612,120 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
     if (!removed) break;
   }
 
-  // ---- body panel triangles, and the armhole loops they define ----
-  //
-  // Built here rather than at render time because the SLEEVE NEEDS THEM. The
-  // armhole is whatever boundary the surviving triangles leave behind, and only
-  // the triangles know that: a rim ordered by angle is not ordered by
-  // adjacency, because the rim is a staircase across a grid rather than a
-  // circle.
-  const bodyTri = [];
-  for (let r = 0; r < NROW - 1; r++) {
-    for (let c = 0; c < NCOL; c++) {
-      const a = idx(c, r), b = idx(c + 1, r);
-      const d = idx(c, r + 1), e = idx(c + 1, r + 1);
-      if (active[a] && active[d] && active[b]) bodyTri.push(a, d, b);
-      if (active[b] && active[d] && active[e]) bodyTri.push(b, d, e);
-    }
-  }
-
-  // Neck is the highest loop, hem the lowest; whatever remains are the armholes.
-  const loops = boundaryLoops(bodyTri).filter((l) => l.length >= 4);
-  const loopY = (l) => l.reduce((a, v) => a + pos[v * 4 + 1], 0) / l.length;
-  const ranked = loops.slice().sort((a, b) => loopY(b) - loopY(a));
-  const armholeLoops = ranked.slice(1, -1);          // drop neck and hem
-
   // ---- sleeves ----
-  //
-  // THE SLEEVE'S FIRST RING IS THE ARMHOLE ITSELF — the same particles, not a
-  // copy sewn to it.
-  //
-  // The previous construction generated an independent ring and pinned it to
-  // the rim with inextensible constraints. Measured, that was 20 pins spread
-  // over a 48-vertex loop: 28 rim vertices carried no constraint at all, and
-  // neighbouring sleeve columns resolved to the SAME rim particle, so the seam
-  // pulled the cap into a point and the fabric crumpled at both shoulders.
-  //
-  // Sharing the vertices removes the failure mode rather than tuning it. There
-  // is no seam to over-constrain, no count mismatch, no gap to bridge, and the
-  // armhole cannot open because it is not a join.
+  // Built as separate small tubes around each upper arm and STITCHED to the
+  // armhole rim, rather than branching the main tube's topology. Physically
+  // the same capture, far simpler to generate correctly.
+  const SCOL = Math.max(10, Math.round(NCOL * 0.32));
   const SROW = 6;
   const sleeves = [];
   const sleevePos = [], sleeveUv = [];
 
-  for (const arm of [armL, armR]) {
-    if (!arm) continue;
-    // Nearest unclaimed armhole loop to this arm's shoulder joint.
-    let hole = null, best = Infinity;
-    for (const l of armholeLoops) {
-      if (l.claimed) continue;
-      let cx = 0, cy = 0, cz = 0;
-      for (const v of l) { cx += pos[v * 4]; cy += pos[v * 4 + 1]; cz += pos[v * 4 + 2]; }
-      const d = (cx / l.length - arm.a.x) ** 2 + (cy / l.length - arm.a.y) ** 2 +
-                (cz / l.length - arm.a.z) ** 2;
-      if (d < best) { best = d; hole = l; }
+  // Find the particles on the edge of each armhole: active, but with at least
+  // one neighbour removed. That ring of points IS the armhole.
+  const rimFor = (hole) => {
+    const out = [];
+    for (let r = 0; r < NROW; r++) {
+      for (let c = 0; c < NCOL; c++) {
+        const i = idx(c, r);
+        if (!active[i]) continue;
+        const edge = !active[idx(c - 1, r)] || !active[idx(c + 1, r)] ||
+          (r > 0 && !active[idx(c, r - 1)]) ||
+          (r < NROW - 1 && !active[idx(c, r + 1)]);
+        if (!edge) continue;
+        tmp.set(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
+        // Only this hole's rim, not the other arm's or the neck's.
+        if (tmp.distanceTo(hole.p) > hole.r * 2.0) continue;
+        out.push(i);
+      }
     }
-    if (!hole) {
-      degraded.push(`no armhole loop found near ${arm.label ?? 'arm'} — sleeve omitted`);
-      continue;
-    }
-    hole.claimed = true;
+    return out;
+  };
 
-    const SCOL = hole.length;
+  for (let k = 0; k < 2; k++) {
+    const arm = k === 0 ? armL : armR;
+    if (!arm) continue;
+    const hole = armholeCentres.find((h) => h.arm === arm);
     const axis = arm.b.clone().sub(arm.a).normalize();
     const alt = Math.abs(axis.dot(up)) < 0.9 ? up : side;
     const u = new THREE.Vector3().crossVectors(axis, alt).normalize();
     const v2 = new THREE.Vector3().crossVectors(axis, u).normalize();
     const rad = arm.rx + COLLISION_MARGIN + ease;
+    const len = sleeveLength;           // fraction of the upper arm covered
 
-    // Each rim vertex keeps its own angle about the arm, so the tube twists to
-    // meet the armhole instead of the fabric having to rotate to reach it.
-    const rimAngle = hole.map((vi) => {
-      const d = new THREE.Vector3(pos[vi * 4], pos[vi * 4 + 1], pos[vi * 4 + 2]).sub(arm.a);
-      return Math.atan2(d.dot(v2), d.dot(u));
-    });
-
-    // Rows 1..SROW-1 only: row 0 is the rim, which already exists.
-    const base = N + sleevePos.length / 4;
-    for (let r = 1; r < SROW; r++) {
-      const f = r / (SROW - 1);
-      const t = 0.02 + f * sleeveLength;
-      const c0 = arm.a.clone().lerp(arm.b, t);
+    // THE SLEEVE HEAD IS THE ARMHOLE.
+    //
+    // Previously the sleeve's top ring was generated around the ARM AXIS while
+    // the armhole rim sits on the TUBE SURFACE — two different surfaces, up to
+    // 157 mm apart on this body. The seam constraints were correctly created
+    // and correctly inextensible, and they faithfully held the sleeve 157 mm
+    // away from the panel. Rigid, and rigidly wrong.
+    //
+    // A real sleeve is cut so its head matches the armhole and is then sewn
+    // edge to edge. So: take the rim, sort it by angle about the arm, resample
+    // it to SCOL points, and make THAT the sleeve's first row. Every seam
+    // stitch then has a rest length of ~0, which is what "sewn" means.
+    const rim = hole ? rimFor(hole) : [];
+    const ringPts = [];
+    let rimOrdered = [];
+    if (rim.length >= 6) {
+      const withAngle = rim.map((i) => {
+        const p = new THREE.Vector3(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
+        const d = p.clone().sub(arm.a);
+        return { i, p, th: Math.atan2(d.dot(v2), d.dot(u)) };
+      }).sort((a, b) => a.th - b.th);
+      rimOrdered = withAngle.map((w) => w.i);
       for (let c = 0; c < SCOL; c++) {
-        const round = c0.clone()
-          .addScaledVector(u, rad * Math.cos(rimAngle[c]))
-          .addScaledVector(v2, rad * Math.sin(rimAngle[c]));
-        // Relax from the armhole's shape toward a clean tube, which is how a
-        // set-in sleeve actually transitions.
-        const rimPt = new THREE.Vector3(pos[hole[c] * 4], pos[hole[c] * 4 + 1],
-                                        pos[hole[c] * 4 + 2]);
-        const pt = rimPt.lerp(round, Math.min(1, f * 1.5));
-        sleevePos.push(pt.x, pt.y, pt.z, 1);
-        sleeveUv.push(c / SCOL, 1 - f);
+        // Walk the rim in angular order and pick the nearest sample, so the
+        // sleeve's columns wrap the hole the same way round.
+        const want = -Math.PI + (c / SCOL) * Math.PI * 2;
+        let best = withAngle[0], bestD = Infinity;
+        for (const w of withAngle) {
+          const d = Math.abs(Math.atan2(Math.sin(w.th - want), Math.cos(w.th - want)));
+          if (d < bestD) { bestD = d; best = w; }
+        }
+        ringPts.push({ p: best.p.clone(), body: best.i });
+      }
+    } else {
+      // Degenerate: no armhole was cut (arms raised clear of the tube, say).
+      // Fall back to a plain ring and flag it — silently producing a detached
+      // sleeve is exactly the failure this whole change is about.
+      degraded.push(`sleeve ${k === 0 ? "L" : "R"}: armhole rim had only ` +
+                    `${rim.length} points, sleeve not sewn to the panel`);
+      for (let c = 0; c < SCOL; c++) {
+        const th = (c / SCOL) * Math.PI * 2;
+        ringPts.push({
+          p: arm.a.clone().lerp(arm.b, 0.02)
+            .addScaledVector(u, rad * Math.cos(th))
+            .addScaledVector(v2, rad * Math.sin(th)),
+          body: -1,
+        });
       }
     }
-    sleeves.push({ base, SCOL, SROW, rim: hole });
+
+    const base = N + sleevePos.length / 4;
+    for (let r = 0; r < SROW; r++) {
+      const f = r / (SROW - 1);
+      const t = 0.02 + f * len;
+      const c0 = arm.a.clone().lerp(arm.b, t);
+      for (let c = 0; c < SCOL; c++) {
+        const th = (c / SCOL) * Math.PI * 2;
+        // Row 0 sits exactly on the rim; lower rows relax toward a clean tube
+        // around the arm, which is how a set-in sleeve actually transitions.
+        const round = c0.clone()
+          .addScaledVector(u, rad * Math.cos(th))
+          .addScaledVector(v2, rad * Math.sin(th));
+        const pt = ringPts[c].p.clone().lerp(round, Math.min(1, f * 1.6));
+        sleevePos.push(pt.x, pt.y, pt.z, 1);
+        sleeveUv.push(c / SCOL, 1 - r / SROW);
+      }
+    }
+    // rimOrdered is every rim particle in angular order. The resampled `ring`
+    // drives the seam CONSTRAINTS; the full rim drives the seam GEOMETRY,
+    // because the rim usually has more vertices than the sleeve has columns
+    // and stitching only the sampled ones leaves the rest of the hole open.
+    sleeves.push({ base, SCOL, SROW, ring: ringPts.map((r) => r.body),
+                   rim: rimOrdered });
   }
 
   const TOTAL = N + sleevePos.length / 4;
@@ -717,8 +738,6 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
 
   // ---- constraints ----
   const A = [], B = [], rest = [], kind = [];
-  // No seam any more: the sleeve shares the armhole's particles, so there is
-  // nothing to stitch and nothing that can pull the cap shut.
   const seam = { count: 0, maxRest: 0, sumRest: 0 };
   // Sleeve particles live past index N and are always active; body particles
   // may have been removed to form an armhole. A constraint touching a removed
@@ -753,12 +772,7 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
     }
   }
 
-  // Row 0 lives in the BODY's index space because it is the armhole itself;
-  // rows 1+ are the sleeve's own particles.
-  const sidx = (s, c, r) => {
-    const cc = ((c % s.SCOL) + s.SCOL) % s.SCOL;
-    return r === 0 ? s.rim[cc] : s.base + (r - 1) * s.SCOL + cc;
-  };
+  const sidx = (s, c, r) => s.base + r * s.SCOL + ((c % s.SCOL) + s.SCOL) % s.SCOL;
   for (const s of sleeves) {
     for (let r = 0; r < s.SROW; r++) {
       for (let c = 0; c < s.SCOL; c++) {
@@ -772,6 +786,30 @@ export function draftShirt({ caps, res = 48, ease = 0.03, hemDrop = null,
       }
     }
 
+    // Sew row 0 to the rim particle it was built from. Because the sleeve head
+    // was cut FROM the rim, each stitch has a rest length of about zero — the
+    // two edges are coincident, which is what a sewn seam is.
+    for (let c = 0; c < s.SCOL; c++) {
+      const si = sidx(s, c, 0);
+      const best = s.ring ? s.ring[c] : -1;
+      const bestD = best >= 0 ? (
+        (allPos[si * 4] - allPos[best * 4]) ** 2 +
+        (allPos[si * 4 + 1] - allPos[best * 4 + 1]) ** 2 +
+        (allPos[si * 4 + 2] - allPos[best * 4 + 2]) ** 2) : 0;
+      // kind 0 == the stretch group, whose compliance is hard-wired to 0 in
+      // GarmentSim.step — i.e. an inextensible seam, which is what a stitched
+      // seam is. Recorded so the debug panel can prove the seam exists and how
+      // long each stitch is: a stitch whose rest length is a large fraction of
+      // the sleeve radius means the sleeve is tacked on at a distance rather
+      // than sewn to the armhole rim, and it will read as "floating".
+      if (best >= 0) {
+        add(si, best, 0);
+        seam.count++;
+        const d = Math.sqrt(bestD);
+        seam.maxRest = Math.max(seam.maxRest, d);
+        seam.sumRest += d;
+      }
+    }
   }
 
   // ---- graph colouring ----
@@ -1063,25 +1101,6 @@ export class GarmentSim {
     this.gpu = null;
     this.sim = null;
     this.numCapsules = 0;
-
-    // Convergence. The old readout was wall-clock time since spawn, which says
-    // nothing about whether the cloth has stopped moving — it just counts.
-    // maxDisp is the largest distance any particle travelled between readbacks,
-    // which is the quantity that actually decides whether it has settled.
-    this.maxDisp = Infinity;
-    this.stillFrames = 0;
-    this.converged = false;
-    this.settleMs = null;
-    this._spawnAt = 0;
-    this._prev = null;
-    this.dispHistory = [];
-  }
-
-  /** Call when anything moves the body, so the solver wakes up again. */
-  wake() {
-    this.converged = false;
-    this.stillFrames = 0;
-    this.settleMs = null;
   }
 
   destroy() {
@@ -1188,13 +1207,6 @@ export class GarmentSim {
       paramsData: new ArrayBuffer(slots * UNIFORM_STRIDE),
       capData: new Float32Array(Math.max(numCapsules * 16, 16)),
     };
-    this.maxDisp = Infinity;
-    this.stillFrames = 0;
-    this.converged = false;
-    this.settleMs = null;
-    this._spawnAt = performance.now();
-    this._prev = new Float32Array(N * 3);
-    this.dispHistory = [];
     return this;
   }
 
@@ -1296,33 +1308,10 @@ export class GarmentSim {
     const count = this.sim.N;
     buf.mapAsync(GPUMapMode.READ).then(() => {
       const src = new Float32Array(buf.getMappedRange());
-      let maxSq = 0;
-      const prev = this._prev;
       for (let i = 0; i < count; i++) {
-        const x = src[i * 4], y = src[i * 4 + 1], z = src[i * 4 + 2];
-        const dx = x - prev[i * 3], dy = y - prev[i * 3 + 1], dz = z - prev[i * 3 + 2];
-        const d = dx * dx + dy * dy + dz * dz;
-        if (d > maxSq) maxSq = d;
-        prev[i * 3] = x; prev[i * 3 + 1] = y; prev[i * 3 + 2] = z;
-        target[i * 3] = x; target[i * 3 + 1] = y; target[i * 3 + 2] = z;
-      }
-      this.maxDisp = Math.sqrt(maxSq);
-      // Keep a short trace so convergence can be READ rather than guessed:
-      // a curve that flattens toward zero is converging slowly, a curve
-      // that plateaus at a fixed height is oscillating and will never
-      // settle however long the loop runs.
-      this.dispHistory.push(this.maxDisp);
-      if (this.dispHistory.length > 240) this.dispHistory.shift();
-      // 0.2 mm between readbacks is below what anyone can see on a garment.
-      // Requiring several consecutive quiet frames avoids calling a momentary
-      // pause at the top of a swing "settled".
-      if (this.maxDisp < 0.0002) {
-        if (++this.stillFrames >= 6 && !this.converged) {
-          this.converged = true;
-          this.settleMs = performance.now() - this._spawnAt;
-        }
-      } else {
-        this.stillFrames = 0;
+        target[i * 3]     = src[i * 4];
+        target[i * 3 + 1] = src[i * 4 + 1];
+        target[i * 3 + 2] = src[i * 4 + 2];
       }
       buf.unmap();
       geometry.attributes.position.needsUpdate = true;
@@ -1383,15 +1372,12 @@ function knitNormalMap(size = 512, loops = 64) {
   const step = size / loops;
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      // Phase, not a sawtooth. The first version used (x % step) / step, whose
-      // wrap is a hard discontinuity — tiled across the garment that reads as a
-      // grid of creases and is easily mistaken for faceting. Driving sin/cos
-      // from the phase directly is continuous everywhere, including at the tile
-      // seam, because the period divides the texture exactly.
-      const px = (x / step) * Math.PI * 2;
-      const py = (y / step) * Math.PI * 2;
-      const nx = Math.sin(px) * 0.42;
-      const ny = Math.sin(py) * 0.22 + Math.cos(px * 2) * 0.08;
+      const u = (x % step) / step - 0.5;      // across a loop
+      const v = (y % step) / step - 0.5;      // along a course
+      // A V-shaped loop: the surface tilts left on one half, right on the
+      // other, and dips between courses.
+      const nx = Math.sin(u * Math.PI * 2) * 0.55;
+      const ny = Math.sin(v * Math.PI * 2) * 0.30 + Math.cos(u * Math.PI * 4) * 0.12;
       const nz = Math.sqrt(Math.max(1e-4, 1 - nx * nx - ny * ny));
       const i = (y * size + x) * 4;
       img.data[i] = (nx * 0.5 + 0.5) * 255;
@@ -1517,14 +1503,14 @@ function albedoMap(colour, print, geom = null, size = 2048) {
  *    and never feeds back into the physics.
  */
 export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
-  const { thickness = 0.006, print = null, knitScale = 5, geom = null } = opts;
+  const { thickness = 0.004, print = null, knitScale = 5, geom = null } = opts;
   const normalMap = knitNormalMap();
   normalMap.repeat.set(knitScale, knitScale * 1.4);   // courses denser than wales
 
   const mat = new THREE.MeshPhysicalMaterial({
     map: albedoMap(colour, print, opts.geom),
     normalMap,
-    normalScale: new THREE.Vector2(0.22, 0.22),
+    normalScale: new THREE.Vector2(0.35, 0.35),
     roughness: 0.92,
     metalness: 0.0,
     sheen: 0.7,
@@ -1532,11 +1518,6 @@ export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
     sheenColor: new THREE.Color(0xffffff),
     side: THREE.DoubleSide,
     transparent: false,
-    opacity: 1,
-    depthWrite: true,
-    // Explicit: a smooth surface is the whole point at this particle count, and
-    // leaving it to the default makes it look accidental.
-    flatShading: false,
   });
 
   mat.userData.thickness = { value: thickness };
@@ -1658,18 +1639,75 @@ export function buildGarmentGeometry(sim) {
       if (act[b] && act[d] && act[e]) tri.push(b, d, e);
     }
   }
-  // Sleeves start at their row 0, which IS the armhole rim, so the tube closes
-  // onto the body with no bridge and no possibility of a gap.
   for (const s of sim.sleeves) {
-    const si = (c, r) => {
-      const cc = ((c % s.SCOL) + s.SCOL) % s.SCOL;
-      return r === 0 ? s.rim[cc] : s.base + (r - 1) * s.SCOL + cc;
-    };
+    const si = (c, r) => s.base + r * s.SCOL + ((c % s.SCOL) + s.SCOL) % s.SCOL;
     for (let r = 0; r < s.SROW - 1; r++) {
       for (let c = 0; c < s.SCOL; c++) {
         const a = si(c, r), b = si(c + 1, r);
         const d = si(c, r + 1), e = si(c + 1, r + 1);
         tri.push(a, d, b, b, d, e);
+      }
+    }
+
+  }
+
+  // ---- sew each sleeve to its armhole ----
+  //
+  // Done AFTER both panels exist, from the real topology: find the body's
+  // boundary loops, take the one nearest each sleeve, and zipper it to the
+  // sleeve's first ring. The loops carry different vertex counts — on the twin
+  // the rim has 48 against the sleeve's 20 — so the walk advances whichever
+  // loop is further behind, which closes the seam for any pair of counts.
+  // Body-panel loops only. The sleeve tubes are open at both ends, so their own
+  // rings are boundary loops as well — and the loop nearest a sleeve ring is
+  // that very ring, at distance zero. Filtering by index keeps the search
+  // looking at the panel it is supposed to sew to.
+  const bodyLoops = boundaryLoops(tri)
+    .filter((l) => l.length >= 4 && l.every((v) => v < sim.bodyCount));
+  const centroid = (loop) => {
+    const c = { x: 0, y: 0, z: 0 };
+    for (const v of loop) { c.x += sim.pos[v * 4]; c.y += sim.pos[v * 4 + 1]; c.z += sim.pos[v * 4 + 2]; }
+    c.x /= loop.length; c.y /= loop.length; c.z /= loop.length;
+    return c;
+  };
+  const dist2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2;
+
+  for (const s of sim.sleeves) {
+    const si = (c, r) => s.base + r * s.SCOL + ((c % s.SCOL) + s.SCOL) % s.SCOL;
+    const ring = [];
+    for (let c = 0; c < s.SCOL; c++) ring.push(si(c, 0));
+    const ringC = centroid(ring);
+
+    let hole = null, bestD = Infinity;
+    for (const l of bodyLoops) {
+      if (l.used) continue;
+      const d = dist2(centroid(l), ringC);
+      if (d < bestD) { bestD = d; hole = l; }
+    }
+    if (!hole) continue;
+    hole.used = true;                       // one armhole per sleeve
+
+    // Start both loops at the same place, or the seam spirals.
+    let off = 0, bo = Infinity;
+    for (let k = 0; k < hole.length; k++) {
+      const v = hole[k];
+      const d = (sim.pos[v * 4] - sim.pos[ring[0] * 4]) ** 2 +
+                (sim.pos[v * 4 + 1] - sim.pos[ring[0] * 4 + 1]) ** 2 +
+                (sim.pos[v * 4 + 2] - sim.pos[ring[0] * 4 + 2]) ** 2;
+      if (d < bo) { bo = d; off = k; }
+    }
+
+    const nR = hole.length, nS = ring.length;
+    let i = 0, j = 0;
+    while (i < nR || j < nS) {
+      const r0 = hole[(off + i) % nR], sA = ring[j % nS];
+      if (j >= nS || (i < nR && (i + 1) / nR <= (j + 1) / nS)) {
+        const r1 = hole[(off + i + 1) % nR];
+        if (r0 !== r1) tri.push(r0, sA, r1);
+        i++;
+      } else {
+        tri.push(r0, ring[(j + 1) % nS], sA);
+        j++;
       }
     }
   }
