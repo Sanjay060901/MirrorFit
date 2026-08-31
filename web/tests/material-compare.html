@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Material A/B — rubber vs cotton jersey</title>
+<style>
+  body { margin: 0; background: #0e1114; color: #dfe6ea; padding: 20px 24px;
+         font: 400 14px/1.6 ui-sans-serif, "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size: 17px; font-weight: 600; margin: 0 0 4px; }
+  p { color: #8fa0aa; max-width: 78ch; margin: 0 0 12px; }
+  #stage { border: 1px solid #222c32; border-radius: 5px; overflow: hidden;
+           width: 1060px; max-width: 100%; }
+  .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+            width: 1060px; max-width: 100%; margin-top: 12px; }
+  .legend div { border: 1px solid #222c32; border-radius: 5px; padding: 11px 13px;
+                background: #14181c; }
+  .legend h2 { margin: 0 0 6px; font-size: 13px; }
+  .legend table { border-collapse: collapse; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+  .legend td { padding: 1px 12px 1px 0; }
+  .legend td:last-child { color: #cfe3ea; }
+  .bad { color: #f0776b; } .good { color: #7de08a; }
+  #status { color: #8fa0aa; margin: 10px 0; }
+  label { color: #8fa0aa; margin-right: 14px; }
+</style>
+</head>
+<body>
+<h1>Material A/B at one camera angle</h1>
+<p>Both halves are the SAME simulated garment — one geometry, two meshes, one
+camera, identical lights. Only the material differs, so anything you see is the
+material and nothing else. Drag to orbit; both sides move together.</p>
+<div>
+  <label>colour
+    <select id="col">
+      <option value="c94f4f">red</option><option value="2f5f8f">blue</option>
+      <option value="e8e4dc">cream</option><option value="2b2b30">charcoal</option>
+    </select></label>
+  <label><input type="checkbox" id="spin" checked> turntable</label>
+</div>
+<div id="status">loading…</div>
+<div id="stage"></div>
+<div class="legend">
+  <div><h2 class="bad">BEFORE — reads as rubber</h2><table>
+    <tr><td>specularIntensity</td><td class="bad">1.0</td></tr>
+    <tr><td>ior</td><td class="bad">1.5</td></tr>
+    <tr><td>sheen / colour</td><td class="bad">0.70 white</td></tr>
+    <tr><td>roughness</td><td>0.92</td></tr>
+    <tr><td>normalScale</td><td>0.35</td></tr>
+    <tr><td>thickness</td><td>0.004 m</td></tr>
+    <tr><td>back faces</td><td class="bad">lit as front</td></tr>
+  </table></div>
+  <div><h2 class="good">AFTER — cotton jersey</h2><table>
+    <tr><td>specularIntensity</td><td class="good">0.12</td></tr>
+    <tr><td>ior</td><td class="good">1.36</td></tr>
+    <tr><td>sheen / colour</td><td class="good">0.45 tinted</td></tr>
+    <tr><td>roughness</td><td>0.85</td></tr>
+    <tr><td>normalScale</td><td>0.22</td></tr>
+    <tr><td>thickness</td><td>0.006 m</td></tr>
+    <tr><td>back faces</td><td class="good">×0.55</td></tr>
+  </table></div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+import { createDevice, measureCapsules, poseCapsules, draftShirt, GarmentSim,
+         buildGarmentGeometry, makeGarmentMaterial, norm } from "../lib/cloth.js";
+
+const $ = (id) => document.getElementById(id);
+const W = 1060, H = 520;
+const SPEC = [
+  { label:"chestUpper", a:"spine01", b:"neck01", owners:["spine01","breast"], elliptical:true },
+  { label:"chest", a:"spine03", b:"spine01", owners:["spine02","spine03","breast"], elliptical:true },
+  { label:"waist", a:"spine04", b:"spine03", owners:["spine03","spine04"], elliptical:true },
+  { label:"hips", a:["upperleg01.L","upperleg01.R"], b:"spine04", owners:["pelvis","spine04"], elliptical:true },
+  { label:"shoulderL", a:"clavicle.L", b:"upperarm01.L", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"shoulderR", a:"clavicle.R", b:"upperarm01.R", owners:["clavicle","shoulder"], elliptical:false },
+  { label:"armL", a:"upperarm01.L", b:"lowerarm01.L", owners:["upperarm01.L","upperarm02.L"], elliptical:false },
+  { label:"armR", a:"upperarm01.R", b:"lowerarm01.R", owners:["upperarm01.R","upperarm02.R"], elliptical:false },
+  { label:"forearmL", a:"lowerarm01.L", b:"wrist.L", owners:["lowerarm01.L","lowerarm02.L"], elliptical:false },
+  { label:"forearmR", a:"lowerarm01.R", b:"wrist.R", owners:["lowerarm01.R","lowerarm02.R"], elliptical:false },
+  { label:"neck", a:"neck01", b:"head", owners:["neck"], elliptical:false },
+];
+
+// The old material, reproduced here rather than kept in the library — a
+// comparison baseline should not be a code path the product can accidentally
+// reach.
+function legacyMaterial(colour) {
+  return new THREE.MeshPhysicalMaterial({
+    color: colour, roughness: 0.92, metalness: 0.0,
+    sheen: 0.7, sheenRoughness: 0.65, sheenColor: new THREE.Color(0xffffff),
+    side: THREE.DoubleSide, transparent: false,
+    // specularIntensity 1.0 and ior 1.5 are the DEFAULTS — not set here, which
+    // is exactly how they went unnoticed.
+  });
+}
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14181c);
+const camera = new THREE.PerspectiveCamera(42, W / H, 1, 8000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(W, H); renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+$("stage").appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.autoRotateSpeed = 2.0;
+$("spin").onchange = (e) => { controls.autoRotate = e.target.checked; };
+
+// Deliberately unflattering lighting: a single strong key is what exposes a
+// specular lobe. Flat ambient would hide the very thing being judged.
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const key = new THREE.DirectionalLight(0xffffff, 1.5); key.position.set(1, 1.4, 1.6);
+const rim = new THREE.DirectionalLight(0x8ab4ff, 0.4); rim.position.set(-1.4, 0.4, -1.2);
+scene.add(key, rim);
+
+let sim = null, geo = null, target = null, matA = null, matB = null;
+
+(async () => {
+  try {
+    const device = await createDevice();
+    const gltf = await new GLTFLoader().loadAsync("../assets/bodytwin.glb");
+    let sk = null; gltf.scene.traverse((o) => { if (o.isSkinnedMesh) sk = o; });
+    const root = gltf.scene;
+    const holder = new THREE.Group(); holder.add(root);
+    holder.scale.set(-279, 279, 279);
+    root.updateWorldMatrix(true, true);
+
+    const byName = new Map(sk.skeleton.bones.map((b) => [norm(b.name), b]));
+    for (const [n, sg] of [["upperarm01.L", -1], ["upperarm01.R", 1]]) {
+      byName.get(norm(n))?.quaternion.multiply(new THREE.Quaternion()
+        .setFromAxisAngle(new THREE.Vector3(0, 0, 1), sg * 38 * Math.PI / 180));
+    }
+    root.updateWorldMatrix(true, true);
+
+    const caps = measureCapsules(sk, root, SPEC);
+    const P = (n) => root.worldToLocal(byName.get(norm(n)).getWorldPosition(new THREE.Vector3()));
+    const left = P("upperarm01.L").sub(P("upperarm01.R")).normalize();
+    const up = P("upperarm01.L").add(P("upperarm01.R")).multiplyScalar(0.5)
+      .sub(P("upperleg01.L").add(P("upperleg01.R")).multiplyScalar(0.5)).normalize();
+    const front = new THREE.Vector3().crossVectors(left, up).normalize();
+    up.crossVectors(front, left).normalize();
+    poseCapsules(caps, root, { left, up, front }, 0);
+
+    const drafted = draftShirt({ caps, res: 88, ease: 0.0159 });
+    sim = new GarmentSim(device, { substeps: 6 });
+    sim.spawn(drafted, caps.length);
+    sim.iterations = 6; sim.bendCompliance = 4e-6; sim.friction = 0.85;
+    sim.setCapsules(caps);
+
+    const built = buildGarmentGeometry(drafted);
+    geo = built.geometry; target = built.renderPos;
+
+    // ONE geometry, two meshes. Any difference is the material, by construction.
+    const colour = parseInt($("col").value, 16);
+    matA = legacyMaterial(colour);
+    matB = makeGarmentMaterial(colour);
+    const a = new THREE.Mesh(geo, matA), b = new THREE.Mesh(geo, matB);
+    const gap = 0.30 * 279;
+    a.position.x = -gap; b.position.x = gap;
+    scene.add(a, b);
+
+    const c = new THREE.Box3().setFromObject(a).getCenter(new THREE.Vector3());
+    camera.position.set(0, c.y, 620);
+    controls.target.set(0, c.y, 0);
+    controls.autoRotate = $("spin").checked;
+
+    $("col").onchange = () => {
+      const v = parseInt($("col").value, 16);
+      matA.color.setHex(v);
+      matB.userData.rebuild?.(v, null);
+    };
+    $("status").textContent =
+      `${drafted.N} particles · ${sim.gpu.totalC} constraints · left = before, right = after`;
+    loop();
+  } catch (e) {
+    $("status").textContent = "failed: " + e.message;
+    console.error(e);
+  }
+})();
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (sim?.gpu) {
+    if (sim.step(1 / 60, true)) sim.readbackInto(geo, target);
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>

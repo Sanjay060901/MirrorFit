@@ -1397,12 +1397,14 @@ function knitNormalMap(size = 512, loops = 64) {
   const step = size / loops;
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const u = (x % step) / step - 0.5;      // across a loop
-      const v = (y % step) / step - 0.5;      // along a course
-      // A V-shaped loop: the surface tilts left on one half, right on the
-      // other, and dips between courses.
-      const nx = Math.sin(u * Math.PI * 2) * 0.55;
-      const ny = Math.sin(v * Math.PI * 2) * 0.30 + Math.cos(u * Math.PI * 4) * 0.12;
+      // Phase, not a sawtooth. (x % step) / step wraps with a hard
+      // discontinuity, and tiled across the garment that reads as a grid of
+      // creases — easily mistaken for faceting. Driving sin/cos from the phase
+      // is continuous everywhere, including at the tile seam.
+      const px = (x / step) * Math.PI * 2;
+      const py = (y / step) * Math.PI * 2;
+      const nx = Math.sin(px) * 0.42;
+      const ny = Math.sin(py) * 0.22 + Math.cos(px * 2) * 0.08;
       const nz = Math.sqrt(Math.max(1e-4, 1 - nx * nx - ny * ny));
       const i = (y * size + x) * 4;
       img.data[i] = (nx * 0.5 + 0.5) * 255;
@@ -1527,50 +1529,99 @@ function albedoMap(colour, print, geom = null, size = 2048) {
  *    rendered surface along its normal gives apparent thickness, costs nothing,
  *    and never feeds back into the physics.
  */
+/**
+ * Cotton jersey.
+ *
+ * The previous settings read as red rubber, and the reason was measurable
+ * rather than aesthetic. MeshPhysicalMaterial defaults to specularIntensity 1
+ * and ior 1.5 — a full plastic-strength Fresnel highlight — and that was
+ * sitting underneath a sheen of 0.7 in pure white. Two glossy lobes stacked on
+ * a saturated colour is vinyl however high the roughness goes.
+ *
+ * Each value below is chosen for cotton specifically.
+ */
 export function makeGarmentMaterial(colour = 0xc94f4f, opts = {}) {
-  const { thickness = 0.004, print = null, knitScale = 5, geom = null } = opts;
+  const { thickness = 0.006, print = null, knitScale = 5, geom = null } = opts;
   const normalMap = knitNormalMap();
   normalMap.repeat.set(knitScale, knitScale * 1.4);   // courses denser than wales
 
+  const base = new THREE.Color(colour);
   const mat = new THREE.MeshPhysicalMaterial({
-    map: albedoMap(colour, print, opts.geom),
-    normalMap,
-    normalScale: new THREE.Vector2(0.35, 0.35),
-    roughness: 0.92,
+    map: albedoMap(colour, print, geom),
+
+    // Cotton scatters light broadly. Below about 0.8 it starts to read as
+    // satin; 0.85 is mid-range for jersey.
+    roughness: 0.85,
+
+    // Fabric is a dielectric. Any metalness tints the highlight with the base
+    // colour, which is what makes a red garment look like painted vinyl.
     metalness: 0.0,
-    sheen: 0.7,
-    sheenRoughness: 0.65,
-    sheenColor: new THREE.Color(0xffffff),
+
+    // THE RUBBER CULPRIT. Default 1.0 is a plastic-strength Fresnel highlight;
+    // fibre has a very weak one.
+    specularIntensity: 0.12,
+
+    // Cellulose is about 1.36. The default 1.5 is window glass, and it widens
+    // the highlight into exactly the glossy rim we are removing.
+    ior: 1.36,
+
+    // Sheen is the retroreflective lobe from the fibre nap — the one optical
+    // property that genuinely separates cloth from plastic. It stays, but
+    // moderate rather than 0.7.
+    sheen: 0.45,
+
+    // Broad and soft. A tight sheen lobe reads as silk or satin.
+    sheenRoughness: 0.9,
+
+    // Tinted toward the garment colour. A pure white sheen blooms off the
+    // surface and looks like a plastic top coat.
+    sheenColor: base.clone().lerp(new THREE.Color(0xffffff), 0.45),
+
+    // The mirror applies a negative x scale, which inverts triangle winding —
+    // single-sided fabric would be culled into invisibility.
     side: THREE.DoubleSide,
+
+    // Cloth is not glass. Explicit, so nothing downstream can quietly enable
+    // blending and bring back the see-through look.
     transparent: false,
+    opacity: 1.0,
+    depthWrite: true,
+
+    // Smooth shading is the whole point at this particle count; leaving it to
+    // the default makes it look accidental.
+    flatShading: false,
+
+    // Fine knit structure, subtle. At 0.35 the weave competed with the drape
+    // and read as a printed pattern rather than a surface.
+    normalMap,
+    normalScale: new THREE.Vector2(0.22, 0.22),
   });
 
   mat.userData.thickness = { value: thickness };
   mat.userData.rebuild = (newColour, newPrint) => {
     mat.map?.dispose();
     mat.map = albedoMap(newColour ?? colour, newPrint ?? print, geom);
+    const c = new THREE.Color(newColour ?? colour);
+    mat.sheenColor = c.clone().lerp(new THREE.Color(0xffffff), 0.45);
     mat.needsUpdate = true;
   };
+
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uThickness = mat.userData.thickness;
-    // DoubleSide lights the inside of the garment exactly like the outside,
-    // which is why it reads as paper rather than cloth — you see through a neck
-    // opening or a hem and the interior is as bright as the chest. Real fabric
-    // interiors are shadowed and slightly desaturated.
+    // The solver treats the garment as an infinitely thin surface, so wherever
+    // it rests exactly on the collision surface the body wins pixels at random
+    // and mottles through. Pushing the rendered surface out along its normal
+    // gives apparent thickness, costs nothing, and never feeds the physics.
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nuniform float uThickness;")
+      .replace("#include <begin_vertex>",
+               "#include <begin_vertex>\ntransformed += normalize(objectNormal) * uThickness;");
+    // DoubleSide lights the inside exactly like the outside, so looking through
+    // a neck opening showed an interior as bright as the chest. Real garment
+    // interiors are shadowed.
     shader.fragmentShader = shader.fragmentShader.replace(
       "#include <color_fragment>",
-      `#include <color_fragment>
-       if (!gl_FrontFacing) { diffuseColor.rgb *= 0.55; }`);
-    // Backtick templates, not "..." with escapes: the newline matters to GLSL
-    // and an escaped \n inside a quoted string is exactly what broke this file
-    // once already.
-    shader.vertexShader = shader.vertexShader
-      .replace("#include <common>",
-               `#include <common>
-                uniform float uThickness;`)
-      .replace("#include <begin_vertex>",
-               `#include <begin_vertex>
-                transformed += normalize(objectNormal) * uThickness;`);
+      "#include <color_fragment>\n  if (!gl_FrontFacing) { diffuseColor.rgb *= 0.55; }");
   };
   return mat;
 }
