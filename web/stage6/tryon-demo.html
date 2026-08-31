@@ -46,8 +46,8 @@
     <span id="armv">38</span>°</label>
   <hr />
   <label>body <select id="bodymode">
-    <option value="off">hidden</option>
-    <option value="ghost" selected>ghost</option>
+    <option value="off" selected>hidden</option>
+    <option value="ghost">ghost (draws over the cloth)</option>
     <option value="solid">solid</option>
   </select></label>
   <label><input type="checkbox" id="spin" checked /> turntable</label>
@@ -229,6 +229,7 @@ function drape() {
     const drafted = draftShirt({ caps: capsules, res, ease });
     if (!sim) sim = new GarmentSim(device, { substeps: 6 });
     sim.spawn(drafted, capsules.length);
+    sim.wake();
     sim.iterations = 7;
     syncUI();
 
@@ -276,6 +277,8 @@ $("arm").addEventListener("input", (e) => { $("armv").textContent = e.target.val
 $("res").addEventListener("input", (e) => { $("resv").textContent = e.target.value; });
 $("res").addEventListener("change", (e) => { res = Number(e.target.value); drape(); });
 $("redrape").addEventListener("click", drape);
+// Orbiting does not move the body, so it must not restart the solver.
+addEventListener("keydown", (e) => { if (e.key === "r") sim?.wake(); });
 $("spin").addEventListener("change", (e) => { controls.autoRotate = e.target.checked; });
 document.querySelectorAll(".sw").forEach((el) => el.addEventListener("click", () => {
   garmentColour = parseInt(el.dataset.c, 16);
@@ -307,7 +310,12 @@ function loop() {
   const dt = Math.min((now - last) / 1000, 1 / 25);
   last = now;
 
-  if (sim?.gpu && garmentMesh) {
+  // EARLY EXIT. The old readout counted wall-clock seconds since spawn and
+  // called that "settle", which measured nothing — it ran the full loop forever
+  // whether the cloth was moving or not. Now the solver stops once no particle
+  // has moved 0.2 mm between readbacks for six consecutive frames, and starts
+  // again the moment the body does.
+  if (sim?.gpu && garmentMesh && !sim.converged) {
     const t0 = performance.now();
     sim.setCapsules(capsules);
     if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
@@ -320,7 +328,9 @@ function loop() {
   statusEl.innerHTML = sim?.sim
     ? `${fps.toFixed(0)} fps · solve ${solveMs.toFixed(2)} ms<br>` +
       `${sim.sim.N} particles · ${sim.gpu.totalC} constraints<br>` +
-      `settled ${settled.toFixed(1)} s`
+      (sim.converged
+        ? `<span style="color:#6d6">settled in ${(sim.settleMs / 1000).toFixed(2)} s — solver idle</span>`
+        : `settling… max move ${(sim.maxDisp * 1000).toFixed(2)} mm`)
     : "loading…";
 
   controls.update();

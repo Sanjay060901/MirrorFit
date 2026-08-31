@@ -451,6 +451,7 @@ function drape() {
     });
     if (!sim) sim = new GarmentSim(device, { substeps: 6 });
     sim.spawn(drafted, capsules.length);
+    sim.wake();
     sim.iterations = 6;
     sim.bendCompliance = pat.drape;      // fleece holds its shape, jersey clings
     sim.friction = 0.85;
@@ -562,7 +563,12 @@ function loop() {
         retarget(sw, raw);
         align(smooth(lm, iF, now));
         alignGroup.updateMatrixWorld(true);
-        if (capsules.length) poseCapsules(capsules, twinModel, bodyFrame(), dt);
+        if (capsules.length) {
+          poseCapsules(capsules, twinModel, bodyFrame(), dt);
+          // Any real body movement restarts the solve.
+          const moved = capsules.some((c) => c.vel && c.vel.lengthSq() > 1e-6);
+          if (moved) sim?.wake();
+        }
         tracked++;
         // Re-cut the pattern once the measured girth has moved enough to matter.
         // 3% of chest width is about 1 cm — below that the shopper would see no
@@ -585,7 +591,9 @@ function loop() {
   if (garmentMesh) garmentMesh.visible = ready;
   $("fitcard").hidden = !(ready && garmentMesh);
 
-  if (sim?.gpu && garmentMesh && ready) {
+  // The wearer moves, so the solver only idles while both the cloth and the
+  // body are still; poseCapsules wakes it whenever the capsules shift.
+  if (sim?.gpu && garmentMesh && ready && !sim.converged) {
     const t0 = performance.now();
     sim.setCapsules(capsules);
     if (sim.step(dt, true)) sim.readbackInto(garmentMesh.geometry, renderPos);
